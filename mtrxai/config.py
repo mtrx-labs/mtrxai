@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -43,19 +44,69 @@ VOICE_DEFAULTS: dict[str, Any] = {
 }
 
 
+def default_project_dir() -> Path:
+    """User-writable home for a first-run project (XDG-style)."""
+    data = os.environ.get("XDG_DATA_HOME") or "~/.local/share"
+    return Path(data).expanduser() / "mtrxai"
+
+
+# Places a template project (settings.toml + agents/) may live. The RPM ships
+# one to /usr/share/mtrxai; a git checkout IS its own template.
+TEMPLATE_DIRS = (
+    Path("/usr/share/mtrxai"),
+    Path(__file__).resolve().parent.parent,
+)
+
+# The directory the package was installed into. Only used as a project-root
+# candidate when it actually contains a settings.toml (a checkout does; a
+# system site-packages does not — that distinction is the RPM first-run fix).
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+
+
+def bootstrap_project(dest: Path, template_dir: Path | None = None) -> Path:
+    """Create a runnable project at `dest`, seeding from a template if one exists.
+
+    Never overwrites: existing settings.toml / agent YAMLs are kept. Returns dest.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "workspace").mkdir(exist_ok=True)
+    (dest / "logs").mkdir(exist_ok=True)
+    template = template_dir or next(
+        (t for t in TEMPLATE_DIRS if (t / "settings.toml").is_file()), None
+    )
+    if template is not None and template.resolve() != dest.resolve():
+        if not (dest / "settings.toml").exists():
+            shutil.copy(template / "settings.toml", dest / "settings.toml")
+        agents = dest / "agents"
+        agents.mkdir(exist_ok=True)
+        for f in sorted((template / "agents").glob("*.yaml")):
+            target = agents / f.name
+            if not target.exists():
+                shutil.copy(f, target)
+    return dest
+
+
 def find_project_root(cli_path: str | None = None) -> Path:
-    """Where settings.toml / agents/ / workspace/ live, in priority order."""
-    candidates: list[Path] = []
+    """Where settings.toml / agents/ / workspace/ live, in priority order.
+
+    Candidates are accepted only if they contain a settings.toml; --project and
+    MTRXAI_PROJECT are also kept when they don't (defaults are used). If nothing
+    matches, the default user project dir is returned (the CLI bootstraps it on
+    first run) — never a system directory like site-packages.
+    """
+    explicit: Path | None = None
     if cli_path:
-        candidates.append(Path(cli_path).expanduser().resolve())
-    if os.environ.get("MTRXAI_PROJECT"):
-        candidates.append(Path(os.environ["MTRXAI_PROJECT"]).expanduser().resolve())
-    candidates.append(Path.cwd())
-    candidates.append(Path(__file__).resolve().parent.parent)  # editable-install repo root
+        explicit = Path(cli_path).expanduser().resolve()
+    elif os.environ.get("MTRXAI_PROJECT"):
+        explicit = Path(os.environ["MTRXAI_PROJECT"]).expanduser().resolve()
+
+    candidates: list[Path] = [Path.cwd(), PACKAGE_ROOT, default_project_dir()]
+    if explicit is not None:
+        candidates.insert(0, explicit)
     for c in candidates:
         if (c / "settings.toml").is_file():
             return c
-    return candidates[0] if cli_path else candidates[-1]
+    return explicit or default_project_dir()
 
 
 def load_env(root: Path) -> None:

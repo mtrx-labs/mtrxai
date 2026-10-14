@@ -11,7 +11,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from . import __version__
-from .config import find_project_root
+from .config import bootstrap_project, find_project_root
 from .core.runtime import assemble
 from .core.ui import ConsoleUI
 
@@ -32,6 +32,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     root = find_project_root(args.project)
+    if not (root / "settings.toml").is_file():
+        bootstrap_project(root)   # first run: seed workspace/logs/settings/agents
 
     if args.mode == "tui":
         try:
