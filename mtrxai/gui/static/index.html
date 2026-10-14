@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mtrxAI</title>
+<link rel="stylesheet" href="/theme.css">
+<link rel="stylesheet" href="/static/app.css">
+<script>
+  // apply stored theme before first paint to avoid a flash
+  (function () {
+    var t = localStorage.getItem("mtrxai-theme");
+    if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+  })();
+</script>
+</head>
+<body>
+<div id="app">
+
+  <header id="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">▚</span>
+      <span class="brand-name">mtrxAI</span>
+      <span class="brand-ver" id="ver"></span>
+    </div>
+    <div class="top-actions">
+      <span class="conn" id="conn" title="event stream">●</span>
+      <button class="btn ghost icon" id="btn-trace" title="Last run trace (ctrl+t)">⌗ trace</button>
+      <button class="btn ghost icon" id="btn-reload" title="Reload agents (ctrl+r)">⟳ reload</button>
+      <button class="btn ghost icon" id="btn-swap" title="Hot-swap a model (ctrl+s)">⇄ swap</button>
+      <button class="btn ghost icon" id="btn-create" title="New agent">+ agent</button>
+      <button class="btn ghost icon" id="btn-theme" title="Toggle dark / light theme">◐ theme</button>
+      <button class="btn danger icon" id="btn-quit" title="Quit (ctrl+q)">⏻</button>
+    </div>
+  </header>
+
+  <main id="body">
+    <section id="chat" aria-label="conversation">
+      <div id="log" role="log" aria-live="polite"></div>
+      <div id="cards"></div>
+      <form id="composer">
+        <button type="button" class="btn ghost icon" id="btn-stop" title="Stop the running task"
+                hidden>■</button>
+        <input id="task" name="task" autocomplete="off" spellcheck="false"
+               placeholder="task…  (try /help, /agents, /trace)">
+        <button type="submit" class="btn primary" id="btn-send">run ⏎</button>
+      </form>
+    </section>
+
+    <aside id="sidebar" aria-label="agents">
+      <h2>agents</h2>
+      <ul id="agent-list"></ul>
+      <h2>runtime</h2>
+      <dl id="runtime-info"></dl>
+    </aside>
+  </main>
+
+  <footer id="statusbar">
+    <span id="status-left">idle</span>
+    <span id="status-right"></span>
+  </footer>
+
+</div>
+
+<dialog id="modal" class="modal">
+  <form method="dialog" id="modal-form">
+    <h3 id="modal-title"></h3>
+    <p id="modal-detail" class="mono"></p>
+    <div id="modal-fields"></div>
+    <div id="modal-buttons"></div>
+  </form>
+</dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

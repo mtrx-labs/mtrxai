@@ -1,0 +1,44 @@
+# mtrxAI global settings. Relative paths resolve against this file's directory.
+
+workspace            = "./workspace"   # jail for agent file/shell tools
+logs                 = "./logs"        # trace.jsonl lives here
+agents_dir           = "./agents"      # the live, hot-swappable agent registry
+max_steps            = 8               # tool-loop iterations per task
+default_permission   = "ask"           # allow | ask | deny (tools without explicit default)
+auto_create_agents   = false           # reserved — creation ALWAYS requires approval in v1
+router_agent         = "router"        # which agent YAML acts as the dispatcher
+default_agent_model  = "ollama:llama3.1:8b"   # model proposed for newly created agents
+
+[providers.ollama]
+base_url = "http://127.0.0.1:11434"
+
+[providers.openai]
+base_url    = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[providers.anthropic]
+api_key_env = "ANTHROPIC_API_KEY"
+
+# Any OpenAI-compatible endpoint: llama-server, LM Studio, vLLM, OpenRouter, Groq…
+[providers.llamacpp]
+base_url    = "http://127.0.0.1:8080/v1"
+api_key_env = ""                      # empty → no auth header
+
+[gguf]
+n_ctx        = 8192
+n_gpu_layers = -1                     # -1 = offload all layers (when supported)
+
+[voice]
+enabled          = false
+wake_model       = "assets/wake/mtrxAI.onnx"
+wake_threshold   = 0.5                # calibrate: python -m mtrxai.voice.calibrate
+refractory_s     = 2.0                # no re-trigger within this window
+silence_ms       = 700                # trailing silence that ends an utterance
+max_utterance_s  = 15.0
+prebuffer_ms     = 300                # audio kept before the trigger (anti-clip)
+stt              = "faster-whisper:base.en"   # or openai:whisper-1
+tts              = "piper:en_US-amy-medium"   # or openai:tts-1
+voices_dir       = "~/.local/share/piper"
+auto_submit      = false              # false = fill input; true = dispatch immediately
+speak_responses  = true               # speak answers to voice-initiated tasks
+input_device     = ""                 # "" = system default; see python -m mtrxai.voice.calibrate --list-devices

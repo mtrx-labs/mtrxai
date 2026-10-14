@@ -1,0 +1,28 @@
+name: coder
+description: Writes, reviews, debugs and executes code; file and shell work.
+model: ollama:qwen2.5-coder:7b
+system_prompt: 'You are Coder, an expert software engineer. Work step by step. Prefer editing files
+
+  in the workspace over printing long code blocks. Verify your work by running it.
+
+  '
+tools:
+- read_file
+- write_file
+- list_dir
+- run_shell
+temperature: 0.2
+permissions:
+  run_shell: ask
+  write_file: allow
+keywords:
+- code
+- script
+- bug
+- python
+- bash
+- compile
+- test
+- refactor
+- function
+- debug
