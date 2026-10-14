@@ -73,6 +73,8 @@ cp settings.toml %{buildroot}%{_datadir}/%{name}/settings.toml
 %license LICENSE
 %doc README.md
 %{_bindir}/mtrxai
+%dir %{_datadir}/%{name}
+%dir %{_datadir}/%{name}/agents
 %{_datadir}/%{name}/agents/*
 %{_datadir}/%{name}/settings.toml
 
