@@ -4,6 +4,7 @@
 #include <json-c/json.h>
 
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <system_error>
@@ -67,9 +68,9 @@ ModelSlot parse_slot(const char* name, json_object* root) {
   }
 
   if (slot.provider != "ollama" && slot.provider != "openai" &&
-      slot.provider != "gguf") {
+      slot.provider != "anthropic" && slot.provider != "gguf") {
     throw std::runtime_error("Provider for " + slot.name +
-                             " must be ollama, openai, or gguf");
+                             " must be ollama, openai, anthropic, or gguf");
   }
   if (slot.model.empty() && slot.provider != "gguf") {
     throw std::runtime_error("Model name is required for " + slot.name);
@@ -79,6 +80,56 @@ ModelSlot parse_slot(const char* name, json_object* root) {
                              " must be between 512 and 32768");
   }
   return slot;
+}
+
+void load_credentials(Config& config, const std::filesystem::path& path) {
+  const auto credentials_path = path.parent_path() / "credentials.json";
+  if (!std::filesystem::exists(credentials_path)) return;
+  if (std::filesystem::is_symlink(
+          std::filesystem::symlink_status(credentials_path))) {
+    throw std::runtime_error("Credentials file must not be a symbolic link: " +
+                             credentials_path.string());
+  }
+  const auto permissions =
+      std::filesystem::status(credentials_path).permissions();
+  if ((permissions & (std::filesystem::perms::group_all |
+                      std::filesystem::perms::others_all)) !=
+      std::filesystem::perms::none) {
+    throw std::runtime_error(
+        "Credentials file permissions are too broad; restrict it to owner "
+        "read/write: " +
+        credentials_path.string());
+  }
+  Json credentials(json_object_from_file(credentials_path.c_str()));
+  if (!credentials ||
+      !json_object_is_type(credentials.get(), json_type_object)) {
+    throw std::runtime_error("Could not parse credentials file: " +
+                            credentials_path.string());
+  }
+  for (auto* slot : {&config.chief, &config.prompter, &config.coder}) {
+    json_object* value = nullptr;
+    if (!json_object_object_get_ex(credentials.get(), slot->name.c_str(),
+                                   &value)) {
+      continue;
+    }
+    if (!json_object_is_type(value, json_type_string)) {
+      throw std::runtime_error("Credential for " + slot->name +
+                               " must be a string");
+    }
+    slot->api_key = json_object_get_string(value);
+  }
+}
+
+Json credentials_json(const Config& config) {
+  Json result(json_object_new_object());
+  const ModelSlot* slots[] = {&config.chief, &config.prompter, &config.coder};
+  for (const auto* slot : slots) {
+    if (!slot->api_key.empty()) {
+      json_object_object_add(result.get(), slot->name.c_str(),
+                             json_object_new_string(slot->api_key.c_str()));
+    }
+  }
+  return result;
 }
 
 }  // namespace
@@ -95,24 +146,15 @@ std::filesystem::path config_path() {
   return std::filesystem::path(home) / ".config" / "mtrxai" / "config.json";
 }
 
-Config default_config() {
-  Config config;
-  config.chief = {"chief", "ollama", "deepseek-r1:8b", "http://localhost:11434",
-                  "", "", 4096};
-  config.prompter = {"prompter", "ollama", "qwen2.5:3b",
-                     "http://localhost:11434", "", "", 4096};
-  config.coder = {"coder", "gguf", "", "http://127.0.0.1",
-                  "", "", 2048};
-  return config;
-}
-
 Config load_config(const std::filesystem::path& path) {
   Json root(json_object_from_file(path.c_str()));
   if (!root || !json_object_is_type(root.get(), json_type_object)) {
     throw std::runtime_error("Could not parse config file: " + path.string());
   }
-  return {parse_slot("chief", root.get()), parse_slot("prompter", root.get()),
-          parse_slot("coder", root.get())};
+  Config config{parse_slot("chief", root.get()), parse_slot("prompter", root.get()),
+                parse_slot("coder", root.get())};
+  load_credentials(config, path);
+  return config;
 }
 
 void save_config(const Config& config, const std::filesystem::path& path) {
@@ -127,6 +169,20 @@ void save_config(const Config& config, const std::filesystem::path& path) {
   if (error) {
     throw std::runtime_error("Could not create config directory: " +
                              error.message());
+  }
+
+  Json credentials = credentials_json(config);
+  const auto credentials_path = path.parent_path() / "credentials.json";
+  if (json_object_object_length(credentials.get()) > 0) {
+    write_atomic(credentials_path,
+                 json_object_to_json_string_ext(credentials.get(),
+                                                JSON_C_TO_STRING_PRETTY));
+  } else if (std::filesystem::exists(credentials_path)) {
+    std::filesystem::remove(credentials_path, error);
+    if (error) {
+      throw std::runtime_error("Could not remove credentials file: " +
+                               error.message());
+    }
   }
 
   write_atomic(path, json_object_to_json_string_ext(

@@ -36,10 +36,7 @@ int main(int argc, char** argv) {
           throw std::runtime_error("Configuration already exists: " +
                                    path.string());
         }
-        mtrxai::save_config(mtrxai::default_config(), path);
-        std::cout << "Created " << path << '\n'
-                  << "Set coder.gguf_path in this file, or use `/gguf coder PATH` "
-                     "in the TUI.\n";
+        mtrxai::run_setup_wizard(path);
         return 0;
       }
       usage(argv[0]);

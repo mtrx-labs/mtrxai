@@ -11,6 +11,7 @@ struct ModelSlot {
   std::string model;
   std::string base_url;
   std::string api_key_env;
+  std::string api_key;
   std::string gguf_path;
   int context_size = 2048;
 };
@@ -22,9 +23,9 @@ struct Config {
 };
 
 std::filesystem::path config_path();
-Config default_config();
 Config load_config(const std::filesystem::path& path);
 void save_config(const Config& config, const std::filesystem::path& path);
+void run_setup_wizard(const std::filesystem::path& path);
 ModelSlot& find_slot(Config& config, const std::string& name);
 const ModelSlot& find_slot(const Config& config, const std::string& name);
 

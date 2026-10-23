@@ -17,10 +17,9 @@ prompt, Coder responses, and manifest are saved under
 in a later stage does not discard earlier work. Existing files overwritten
 after approval are backed up in that session directory.
 
-The default Prompter is `qwen2.5:3b`: it is small enough for a 16 GB, CPU-only
-machine while being capable of turning a task brief into a structured coding
-prompt. Model choices are defaults, not dependencies; each role can use a
-different Ollama model, an OpenAI-compatible API, or a local GGUF file.
+Each role can use a different Ollama model, OpenAI, Anthropic, or a local GGUF
+file. Provider and model choices are made during setup rather than tied to
+machine-specific defaults.
 
 **A single-model-at-a-time strategy reduces peak RAM, but cannot make an
 oversized model fit.** The supplied Mellum Q6 GGUF is about 11 GB; on a 16 GB
@@ -42,23 +41,21 @@ cmake --build build -j2
 ./build/mtrxai
 ```
 
-The default assignments are:
+Run `mtrxai --init` in an interactive terminal to open the setup wizard. For
+each role it offers GGUF, Ollama, OpenAI, and Anthropic and asks for the
+provider-specific model, endpoint, file path, or API key. GGUF paths support
+`~` expansion and must point to a readable file. API-key entry is hidden.
+Keys are saved separately in `credentials.json` beside the config (by default
+`~/.config/mtrxai/credentials.json`) with owner-only permissions; they are not
+written to `config.json`. This local credentials file is plaintext protected
+by filesystem permissions, so protect your account and backups accordingly.
+Existing environment-variable keys (`api_key_env`) remain supported.
 
-| Role | Default |
-|---|---|
-| Chief of Staff | Ollama `deepseek-r1:8b` |
-| Prompter | Ollama `qwen2.5:3b` |
-| Coder | GGUF via llama.cpp (choose your local model path) |
-
-Pull the Ollama models before using them, and install `llama-server` from
-[llama.cpp](https://github.com/ggml-org/llama.cpp) for GGUF inference. The
-coder GGUF path is intentionally blank on first run: set `coder.gguf_path` in
-`~/.config/mtrxai/config.json` or enter `/gguf coder /path/to/your/model.gguf`
-in the TUI. No user's home directory or model location is assumed. The GGUF
-server uses the role's `context_size` (2048 tokens for the
-default Coder) and explicitly disables GPU layers. Lower a role's
-`context_size` in the config if memory pressure
-requires it; increase it only when there is RAM headroom.
+Install `llama-server` from [llama.cpp](https://github.com/ggml-org/llama.cpp)
+for GGUF inference and pull any configured Ollama models before using them.
+The GGUF server uses the role's `context_size` (2048 tokens for the Coder) and
+explicitly disables GPU layers. Lower a role's `context_size` in the config if
+memory pressure requires it; increase it only when there is RAM headroom.
 
 ## Providers and hot swapping
 
@@ -71,14 +68,16 @@ Edit `~/.config/mtrxai/config.json` or use TUI commands:
 /gguf coder /path/to/your/Mellum2.1-12B-A2.5B-Thinking-Q6_K.gguf
 /endpoint coder https://api.example.com/v1
 /keyenv coder MY_API_KEY
+/apikey coder
 ```
 
-For an OpenAI-compatible provider, set `provider` to `openai`, configure
-`base_url` (the service root or its `/v1` URL), `model`, and optionally
-`api_key_env`. The API key is read from that environment variable and is never
-written to the config. A locally running llama.cpp server can also be used as
-an OpenAI-compatible endpoint. For direct GGUF use, install `llama-server`;
-mtrxAI starts it for the Coder stage and terminates it afterward.
+Set a role's `provider` to `openai` for an OpenAI-compatible `/chat/completions`
+endpoint or `anthropic` for Anthropic's native Messages API. Both support
+`api_key_env`; wizard-provided keys are loaded from the private
+`credentials.json`. `/apikey ROLE` lets you securely enter or clear a key from
+inside the TUI after switching providers. A locally running llama.cpp server
+can also be used as an OpenAI-compatible endpoint. For direct GGUF use, install
+`llama-server`; mtrxAI starts it for the Coder stage and terminates it afterward.
 
 ## Applying code
 

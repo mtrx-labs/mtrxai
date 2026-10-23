@@ -14,38 +14,123 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-def check_portable_default_config(binary, root):
-    config_home = root / "portable-config"
-    user_home = root / "different-user-home"
+def check_setup_wizard(binary, root):
+    config_home = root / "wizard-config"
+    user_home = root / "wizard-home"
     user_home.mkdir()
+    model_dir = user_home / "models"
+    model_dir.mkdir()
+    gguf = model_dir / "chief.gguf"
+    gguf.write_bytes(b"mock gguf")
     env = os.environ.copy()
-    env.update({"HOME": str(user_home), "XDG_CONFIG_HOME": str(config_home)})
-    result = subprocess.run(
-        [binary, "--init"], env=env, text=True, capture_output=True, check=True
-    )
-    assert "coder.gguf_path" in result.stdout
-    config_path = config_home / "mtrxai" / "config.json"
-    config = json.loads(config_path.read_text())
-    assert config["coder"]["provider"] == "gguf"
-    assert config["coder"]["gguf_path"] == ""
-    assert str(user_home) not in config_path.read_text()
-
+    env.update({"HOME": str(user_home), "XDG_CONFIG_HOME": str(config_home), "TERM": "xterm"})
     master, slave = pty.openpty()
     process = subprocess.Popen(
-        [binary], cwd=root, env={**env, "TERM": "xterm"},
+        [binary, "--init"], cwd=root, env=env,
         stdin=slave, stdout=slave, stderr=slave,
     )
     os.close(slave)
     output = bytearray()
-    try:
-        deadline = time.time() + 10
-        while b"Coder GGUF path is unset" not in output and time.time() < deadline:
+    transcript = bytearray()
+
+    def wait_for(needle, timeout=8):
+        target = needle.encode()
+        deadline = time.time() + timeout
+        while target not in output and time.time() < deadline:
             readable, _, _ = select.select([master], [], [], 0.2)
             if readable:
-                output.extend(os.read(master, 8192))
-        assert b"Coder GGUF path is unset" in output, output.decode(errors="replace")
-        os.write(master, b"/quit\n")
+                try:
+                    received = os.read(master, 8192)
+                    output.extend(received)
+                    transcript.extend(received)
+                except OSError:
+                    break
+        assert target in output, output.decode(errors="replace")
+
+    def answer(needle, value):
+        wait_for(needle)
+        os.write(master, value)
+        output.clear()
+
+    try:
+        answer("Choose a provider (1-4 or name)", b"1\n")
+        answer("Path to GGUF model", b"~/models/chief.gguf\n")
+        wait_for("2 / 3")
+        answer("Choose a provider (1-4 or name)", b"3\n")
+        answer("OpenAI-compatible API base URL", b"\n")
+        answer("OpenAI model name", b"wizard-openai-model\n")
+        answer("OpenAI API key (input is hidden)", b"wizard-openai-secret\n")
+        wait_for("3 / 3")
+        answer("Choose a provider (1-4 or name)", b"4\n")
+        answer("Anthropic API base URL", b"\n")
+        answer("Anthropic model name", b"wizard-anthropic-model\n")
+        answer("Anthropic API key (input is hidden)", b"wizard-anthropic-secret\n")
+        wait_for("Setup complete.")
         assert process.wait(timeout=5) == 0
+        assert b"wizard-openai-secret" not in transcript
+        assert b"wizard-anthropic-secret" not in transcript
+        config_path = config_home / "mtrxai" / "config.json"
+        config_text = config_path.read_text()
+        config = json.loads(config_text)
+        assert config["chief"]["provider"] == "gguf"
+        assert config["chief"]["gguf_path"] == str(gguf)
+        assert config["prompter"]["provider"] == "openai"
+        assert config["prompter"]["model"] == "wizard-openai-model"
+        assert config["prompter"]["base_url"] == "https://api.openai.com/v1"
+        assert config["coder"]["provider"] == "anthropic"
+        assert config["coder"]["model"] == "wizard-anthropic-model"
+        assert "wizard-openai-secret" not in config_text
+        assert "wizard-anthropic-secret" not in config_text
+        credentials_path = config_path.parent / "credentials.json"
+        assert json.loads(credentials_path.read_text()) == {
+            "prompter": "wizard-openai-secret",
+            "coder": "wizard-anthropic-secret",
+        }
+        assert stat.S_IMODE(credentials_path.stat().st_mode) == 0o600
+
+        ui_master, ui_slave = pty.openpty()
+        ui = subprocess.Popen(
+            [binary], cwd=root, env=env, stdin=ui_slave, stdout=ui_slave, stderr=ui_slave
+        )
+        os.close(ui_slave)
+        ui_output = bytearray()
+        ui_transcript = bytearray()
+
+        def wait_ui(needle, timeout=8):
+            target = needle.encode()
+            deadline = time.time() + timeout
+            while target not in ui_output and time.time() < deadline:
+                readable, _, _ = select.select([ui_master], [], [], 0.2)
+                if readable:
+                    try:
+                        received = os.read(ui_master, 8192)
+                        ui_output.extend(received)
+                        ui_transcript.extend(received)
+                    except OSError:
+                        break
+            assert target in ui_output, ui_output.decode(errors="replace")
+            ui_output.clear()
+
+        try:
+            wait_ui("Enter a task")
+            os.write(ui_master, b"/apikey prompter\n")
+            wait_ui("API key for prompter")
+            os.write(ui_master, b"new-tui-secret\n")
+            wait_ui("Saved API key for prompter.")
+            assert b"new-tui-secret" not in ui_transcript
+            os.write(ui_master, b"x")
+            wait_ui("Enter a task")
+            os.write(ui_master, b"/quit\n")
+            assert ui.wait(timeout=5) == 0
+            assert json.loads(credentials_path.read_text())["prompter"] == (
+                "new-tui-secret"
+            )
+            assert stat.S_IMODE(credentials_path.stat().st_mode) == 0o600
+        finally:
+            if ui.poll() is None:
+                ui.terminate()
+                ui.wait(timeout=3)
+            os.close(ui_master)
     finally:
         if process.poll() is None:
             process.terminate()
@@ -55,7 +140,7 @@ def check_portable_default_config(binary, root):
 
 def run(binary):
     temp = Path(tempfile.mkdtemp(prefix="mtrxai-e2e-"))
-    check_portable_default_config(binary, temp)
+    check_setup_wizard(binary, temp)
     workspace = temp / "workspace"
     outside = temp / "outside"
     config_home = temp / "config"
@@ -114,7 +199,13 @@ def run(binary):
                 self.wfile.write(response)
                 return
 
-            requests.append({"path": self.path, "body": body})
+            requests.append(
+                {
+                    "path": self.path,
+                    "body": body,
+                    "headers": dict(self.headers.items()),
+                }
+            )
             if self.path == "/api/generate":
                 response = json.dumps({"response": "", "done": True}).encode()
                 self.send_response(200)
@@ -125,7 +216,12 @@ def run(binary):
                 return
             answer = actions[len(chat_requests)]
             chat_requests.append(body)
-            response = json.dumps({"message": {"content": answer}}).encode()
+            if self.path == "/v1/messages":
+                response = json.dumps(
+                    {"content": [{"type": "text", "text": answer}]}
+                ).encode()
+            else:
+                response = json.dumps({"message": {"content": answer}}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(response)))
@@ -138,15 +234,22 @@ def run(binary):
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     config = {}
-    for role in ("chief", "prompter"):
-        config[role] = {
-            "provider": "ollama",
-            "model": f"{role}-test",
-            "base_url": f"http://127.0.0.1:{server.server_port}",
-            "api_key_env": "",
-            "gguf_path": "",
-            "context_size": 2048,
-        }
+    config["chief"] = {
+        "provider": "anthropic",
+        "model": "chief-test",
+        "base_url": f"http://127.0.0.1:{server.server_port}",
+        "api_key_env": "",
+        "gguf_path": "",
+        "context_size": 2048,
+    }
+    config["prompter"] = {
+        "provider": "ollama",
+        "model": "prompter-test",
+        "base_url": f"http://127.0.0.1:{server.server_port}",
+        "api_key_env": "",
+        "gguf_path": "",
+        "context_size": 2048,
+    }
     config["coder"] = {
         "provider": "gguf",
         "model": "",
@@ -163,6 +266,9 @@ def run(binary):
     config_path = config_home / "mtrxai" / "config.json"
     config_path.parent.mkdir(parents=True)
     config_path.write_text(json.dumps(config))
+    credentials_path = config_path.parent / "credentials.json"
+    credentials_path.write_text(json.dumps({"chief": "test-anthropic-key"}))
+    credentials_path.chmod(0o600)
     env = os.environ.copy()
     env.update(
         {
@@ -246,16 +352,18 @@ def run(binary):
         assert not (workspace / "declined-command.txt").exists()
         assert not (outside / "outside.txt").exists()
         assert len(generated_requests) == 16, len(generated_requests)
-        assert [entry["path"] for entry in requests[:4]] == [
-            "/api/chat",
-            "/api/generate",
+        assert [entry["path"] for entry in requests[:3]] == [
+            "/v1/messages",
             "/api/chat",
             "/api/generate",
         ]
-        assert requests[0]["body"]["keep_alive"] == "30s"
-        assert requests[1]["body"]["keep_alive"] == 0
-        assert requests[2]["body"]["keep_alive"] == "30s"
-        assert requests[3]["body"]["keep_alive"] == 0
+        headers = {key.lower(): value for key, value in requests[0]["headers"].items()}
+        assert headers["x-api-key"] == "test-anthropic-key"
+        assert headers["anthropic-version"] == "2023-06-01"
+        assert requests[0]["body"]["model"] == "chief-test"
+        assert requests[0]["body"]["system"]
+        assert requests[1]["body"]["keep_alive"] == "30s"
+        assert requests[2]["body"]["keep_alive"] == 0
         assert "existing.txt" in json.dumps(generated_requests[1]["body"]["messages"])
         assert "original file" in json.dumps(generated_requests[2]["body"]["messages"])
         assert "sensitive file" in json.dumps(generated_requests[3]["body"]["messages"])

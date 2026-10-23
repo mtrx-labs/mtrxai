@@ -18,6 +18,7 @@
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace mtrxai {
@@ -56,7 +57,8 @@ std::size_t discard_body(char*, std::size_t size, std::size_t count, void*) {
 
 HttpResponse post_json(const std::string& url, const std::string& body,
                        const std::string& api_key = "",
-                       long timeout_seconds = 3600) {
+                       long timeout_seconds = 3600,
+                       const std::vector<std::string>& extra_headers = {}) {
   CURL* curl = curl_easy_init();
   if (curl == nullptr) throw std::runtime_error("Could not create HTTP request");
   HttpResponse response;
@@ -64,6 +66,9 @@ HttpResponse post_json(const std::string& url, const std::string& body,
   headers = curl_slist_append(headers, "Content-Type: application/json");
   const std::string authorization = "Authorization: Bearer " + api_key;
   if (!api_key.empty()) headers = curl_slist_append(headers, authorization.c_str());
+  for (const auto& header : extra_headers) {
+    headers = curl_slist_append(headers, header.c_str());
+  }
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
   curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
@@ -174,6 +179,60 @@ std::string openai_generate(const ModelSlot& slot, const Messages& messages,
     throw std::runtime_error("OpenAI-compatible response is missing choices[0].message");
   }
   return json_string(message, "content");
+}
+
+std::string anthropic_generate(const ModelSlot& slot, const Messages& messages,
+                               const std::string& base_url,
+                               const std::string& api_key) {
+  Json body(json_object_new_object());
+  json_object_object_add(body.get(), "model",
+                         json_object_new_string(slot.model.c_str()));
+  json_object_object_add(body.get(), "max_tokens", json_object_new_int(4096));
+  Json request_messages(json_object_new_array());
+  std::string system_prompt;
+  for (const auto& [role, content] : messages) {
+    if (role == "system") {
+      if (!system_prompt.empty()) system_prompt += "\n\n";
+      system_prompt += content;
+      continue;
+    }
+    Json item(json_object_new_object());
+    json_object_object_add(item.get(), "role",
+                           json_object_new_string(role.c_str()));
+    json_object_object_add(item.get(), "content",
+                           json_object_new_string(content.c_str()));
+    json_object_array_add(request_messages.get(), item.release());
+  }
+  if (!system_prompt.empty()) {
+    json_object_object_add(body.get(), "system",
+                           json_object_new_string(system_prompt.c_str()));
+  }
+  json_object_object_add(body.get(), "messages", request_messages.release());
+  const std::vector<std::string> headers = {
+      "x-api-key: " + api_key, "anthropic-version: 2023-06-01"};
+  std::string endpoint = normalize_url(base_url);
+  if (endpoint.size() < 3 || endpoint.substr(endpoint.size() - 3) != "/v1") {
+    endpoint += "/v1";
+  }
+  const auto response = post_json(
+      endpoint + "/messages",
+      json_object_to_json_string_ext(body.get(), JSON_C_TO_STRING_PLAIN), "",
+      3600, headers);
+  Json root(json_tokener_parse(response.body.c_str()));
+  if (!root || !json_object_is_type(root.get(), json_type_object)) {
+    throw std::runtime_error("Anthropic returned invalid JSON");
+  }
+  json_object* content = nullptr;
+  if (!json_object_object_get_ex(root.get(), "content", &content) ||
+      !json_object_is_type(content, json_type_array)) {
+    throw std::runtime_error("Anthropic response is missing content");
+  }
+  for (std::size_t i = 0; i < json_object_array_length(content); ++i) {
+    json_object* block = json_object_array_get_idx(content, i);
+    if (block == nullptr || !json_object_is_type(block, json_type_object)) continue;
+    if (json_string(block, "type") == "text") return json_string(block, "text");
+  }
+  throw std::runtime_error("Anthropic response contains no text content");
 }
 
 unsigned short available_port() {
@@ -309,7 +368,22 @@ struct InferenceSession::Impl {
       if (endpoint.size() < 3 || endpoint.substr(endpoint.size() - 3) != "/v1") {
         endpoint += "/v1";
       }
-      api_key = environment_key(slot.api_key_env);
+      api_key = slot.api_key.empty() ? environment_key(slot.api_key_env)
+                                     : slot.api_key;
+      return;
+    }
+    if (slot.provider == "anthropic") {
+      if (base_url.empty()) {
+        throw std::runtime_error("An Anthropic API URL is required for " +
+                                 slot.name);
+      }
+      api_key = slot.api_key.empty() ? environment_key(slot.api_key_env)
+                                     : slot.api_key;
+      if (api_key.empty()) {
+        throw std::runtime_error("An Anthropic API key is required for " +
+                                 slot.name +
+                                 "; configure credentials.json or api_key_env.");
+      }
       return;
     }
     if (slot.provider == "gguf") {
@@ -340,6 +414,10 @@ std::string InferenceSession::generate(const Messages& messages) {
   }
   if (impl_->slot.provider == "ollama") {
     return ollama_generate(impl_->slot, messages, impl_->base_url);
+  }
+  if (impl_->slot.provider == "anthropic") {
+    return anthropic_generate(impl_->slot, messages, impl_->base_url,
+                              impl_->api_key);
   }
   return openai_generate(impl_->slot, messages, impl_->endpoint, impl_->api_key);
 }

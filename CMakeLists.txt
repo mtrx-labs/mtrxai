@@ -22,6 +22,7 @@ add_executable(mtrxai
   src/main.cpp
   src/pipeline.cpp
   src/provider.cpp
+  src/setup_wizard.cpp
   src/tui.cpp
 )
 target_include_directories(mtrxai PRIVATE include ${CURSES_INCLUDE_DIRS})

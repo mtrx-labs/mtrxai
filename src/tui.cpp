@@ -5,8 +5,10 @@
 #include <ncurses.h>
 
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -129,13 +131,34 @@ void show_roles(const Config& config) {
 void command_help() {
   show("Commands:\n"
        "  /roles                         show the active model assignments\n"
-       "  /model ROLE PROVIDER MODEL      hot-swap a role (ollama, openai, gguf)\n"
-       "  /endpoint ROLE URL              set an OpenAI-compatible API base URL\n"
+       "  /model ROLE PROVIDER MODEL      hot-swap a role (ollama, openai, anthropic, gguf)\n"
+       "  /endpoint ROLE URL              set an API base URL\n"
        "  /keyenv ROLE ENV_NAME           select an API-key environment variable\n"
+       "  /apikey ROLE                    enter or clear a saved API key (hidden input)\n"
        "  /gguf ROLE PATH                 set a local GGUF file path\n"
        "Use Up/Down or PgUp/PgDn to review every proposed file or shell command.\n"
        "  /help                           show this help\n"
        "  /quit                           exit");
+}
+
+std::optional<std::string> read_api_key(const std::string& role) {
+  show("API key for " + role +
+       " (input is hidden; Enter saves, Esc cancels).");
+  std::string key;
+  while (true) {
+    const int character = getch();
+    if (character == ERR || character == 27) return std::nullopt;
+    if (character == '\n' || character == KEY_ENTER) return key;
+    if (character == KEY_BACKSPACE || character == 127 || character == 8) {
+      if (!key.empty()) key.pop_back();
+      continue;
+    }
+    if (character >= 0 && character <= 255 &&
+        std::isprint(static_cast<unsigned char>(character)) &&
+        key.size() < 4096) {
+      key.push_back(static_cast<char>(character));
+    }
+  }
 }
 
 std::string expand_home(const std::string& value) {
@@ -165,6 +188,27 @@ void handle_command(Config& config, const std::filesystem::path& config_file,
   }
   std::string role;
   command >> role;
+  if (name == "/apikey") {
+    if (role.empty()) {
+      show("Usage: /apikey ROLE");
+      return;
+    }
+    auto& slot = find_slot(config, role);
+    if (slot.provider != "openai" && slot.provider != "anthropic") {
+      show("Select an OpenAI or Anthropic provider before setting an API key.");
+      return;
+    }
+    auto key = read_api_key(role);
+    if (!key) {
+      show("API key entry cancelled.");
+      return;
+    }
+    slot.api_key = std::move(*key);
+    save_config(config, config_file);
+    show(slot.api_key.empty() ? "Saved API key cleared for " + role + "."
+                              : "Saved API key for " + role + ".");
+    return;
+  }
   if (name == "/endpoint" || name == "/keyenv" || name == "/gguf") {
     std::string value;
     command >> value;
@@ -192,11 +236,13 @@ void handle_command(Config& config, const std::filesystem::path& config_file,
       show("Usage: /model ROLE PROVIDER MODEL");
       return;
     }
-    if (provider != "ollama" && provider != "openai" && provider != "gguf") {
-      show("Provider must be ollama, openai, or gguf.");
+    if (provider != "ollama" && provider != "openai" &&
+        provider != "anthropic" && provider != "gguf") {
+      show("Provider must be ollama, openai, anthropic, or gguf.");
       return;
     }
     auto& slot = find_slot(config, role);
+    if (slot.provider != provider) slot.api_key.clear();
     slot.provider = provider;
     if (provider == "gguf") {
       slot.gguf_path = expand_home(model);
