@@ -118,7 +118,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: packages-deb-rpm
-          path: dist/*
+          path: |
+            dist/*.deb
+            dist/*.rpm
           if-no-files-found: error
 
   package-arch:
