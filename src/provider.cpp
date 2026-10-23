@@ -55,7 +55,8 @@ std::size_t discard_body(char*, std::size_t size, std::size_t count, void*) {
 }
 
 HttpResponse post_json(const std::string& url, const std::string& body,
-                       const std::string& api_key = "") {
+                       const std::string& api_key = "",
+                       long timeout_seconds = 3600) {
   CURL* curl = curl_easy_init();
   if (curl == nullptr) throw std::runtime_error("Could not create HTTP request");
   HttpResponse response;
@@ -68,7 +69,7 @@ HttpResponse post_json(const std::string& url, const std::string& body,
   curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, append_body);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3600L);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_seconds);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
   const CURLcode result = curl_easy_perform(curl);
   if (result == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status);
@@ -124,7 +125,8 @@ std::string ollama_generate(const ModelSlot& slot, const Messages& messages,
   Json parsed_messages(json_tokener_parse(messages_json(messages).c_str()));
   json_object_object_add(body.get(), "messages", parsed_messages.release());
   json_object_object_add(body.get(), "stream", json_object_new_boolean(false));
-  json_object_object_add(body.get(), "keep_alive", json_object_new_int(0));
+  json_object_object_add(body.get(), "keep_alive",
+                         json_object_new_string("30s"));
   Json options(json_object_new_object());
   json_object_object_add(options.get(), "num_ctx",
                          json_object_new_int(slot.context_size));
@@ -281,29 +283,87 @@ std::string environment_key(const std::string& name) {
 
 }  // namespace
 
-std::string generate(const ModelSlot& slot, const Messages& messages,
-                     const std::function<void(const std::string&)>& status) {
-  const auto base_url = normalize_url(slot.base_url);
-  if (slot.provider == "ollama") {
-    status("Running Ollama request; keep_alive=0 unloads the model after this stage.");
-    return ollama_generate(slot, messages, base_url);
-  }
-  if (slot.provider == "openai") {
-    if (base_url.empty()) {
-      throw std::runtime_error("An endpoint URL is required for " + slot.name);
+struct InferenceSession::Impl {
+  ModelSlot slot;
+  Status status;
+  std::string base_url;
+  std::string endpoint;
+  std::string api_key;
+  std::unique_ptr<LlamaServer> llama_server;
+  bool released = false;
+
+  Impl(const ModelSlot& model, const Status& update)
+      : slot(model), status(update), base_url(normalize_url(model.base_url)) {
+    if (slot.provider == "ollama") {
+      if (base_url.empty()) {
+        throw std::runtime_error("An Ollama URL is required for " + slot.name);
+      }
+      status("Ollama will keep this role loaded only during its stage.");
+      return;
     }
-    std::string endpoint = base_url;
-    if (endpoint.size() < 3 || endpoint.substr(endpoint.size() - 3) != "/v1") {
-      endpoint += "/v1";
+    if (slot.provider == "openai") {
+      if (base_url.empty()) {
+        throw std::runtime_error("An endpoint URL is required for " + slot.name);
+      }
+      endpoint = base_url;
+      if (endpoint.size() < 3 || endpoint.substr(endpoint.size() - 3) != "/v1") {
+        endpoint += "/v1";
+      }
+      api_key = environment_key(slot.api_key_env);
+      return;
     }
-    return openai_generate(slot, messages, endpoint,
-                           environment_key(slot.api_key_env));
+    if (slot.provider == "gguf") {
+      llama_server = std::make_unique<LlamaServer>(slot, status);
+      endpoint = llama_server->endpoint();
+      return;
+    }
+    throw std::runtime_error("Unsupported provider: " + slot.provider);
   }
-  if (slot.provider == "gguf") {
-    LlamaServer server(slot, status);
-    return openai_generate(slot, messages, server.endpoint(), "");
+};
+
+InferenceSession::InferenceSession(const ModelSlot& slot, const Status& status)
+    : impl_(std::make_unique<Impl>(slot, status)) {}
+
+InferenceSession::~InferenceSession() noexcept {
+  if (impl_ && impl_->llama_server) impl_->llama_server.reset();
+}
+
+std::string InferenceSession::generate(const Messages& messages) {
+  if (impl_->released) {
+    throw std::runtime_error("Cannot generate after the model stage is unloaded.");
   }
-  throw std::runtime_error("Unsupported provider: " + slot.provider);
+  if (impl_->slot.provider == "ollama") {
+    return ollama_generate(impl_->slot, messages, impl_->base_url);
+  }
+  return openai_generate(impl_->slot, messages, impl_->endpoint, impl_->api_key);
+}
+
+void InferenceSession::release() {
+  if (!impl_ || impl_->released) return;
+  if (impl_->slot.provider == "ollama") {
+    impl_->status("Unloading Ollama model before the next role...");
+    Json body(json_object_new_object());
+    json_object_object_add(body.get(), "model",
+                           json_object_new_string(impl_->slot.model.c_str()));
+    json_object_object_add(body.get(), "keep_alive", json_object_new_int(0));
+    try {
+      post_json(impl_->base_url + "/api/generate",
+                json_object_to_json_string_ext(body.get(), JSON_C_TO_STRING_PLAIN),
+                "", 10);
+    } catch (const std::exception& error) {
+      impl_->released = true;
+      throw std::runtime_error(
+          std::string("Could not unload the Ollama model before the next role; "
+                      "it will auto-unload after 30 seconds: ") +
+          error.what());
+    }
+    impl_->status("Ollama model unloaded.");
+  }
+  if (impl_->llama_server) {
+    impl_->status("Stopping llama-server before the next role...");
+    impl_->llama_server.reset();
+  }
+  impl_->released = true;
 }
 
 }  // namespace mtrxai

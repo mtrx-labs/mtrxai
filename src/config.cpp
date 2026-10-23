@@ -113,7 +113,7 @@ Config default_config() {
                   "", (std::filesystem::path(home) / "cooking" /
                        "Mellum2.1-12B-A2.5B-Thinking-Q6_K.gguf")
                           .string(),
-                  4096};
+                  2048};
   return config;
 }
 

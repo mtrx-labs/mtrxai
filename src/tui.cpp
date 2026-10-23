@@ -4,26 +4,111 @@
 
 #include <ncurses.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace mtrxai {
 namespace {
 
+std::string safe_terminal_text(const std::string& text) {
+  std::string safe;
+  safe.reserve(text.size());
+  for (unsigned char character : text) {
+    if (character == '\n' || character == '\t' || character >= 0x20) {
+      if (character != 0x7f) safe.push_back(static_cast<char>(character));
+    } else {
+      safe.push_back('?');
+    }
+  }
+  return safe;
+}
+
 void show(const std::string& text) {
   erase();
-  mvprintw(0, 0, "mtrxAI | sequential coding agents | Ctrl-D to quit");
+  attron(A_BOLD | (has_colors() ? COLOR_PAIR(2) : 0));
+  mvprintw(0, 0, " mtrxAI  /  SEQUENTIAL CODING AGENTS");
+  attroff(A_BOLD | (has_colors() ? COLOR_PAIR(2) : 0));
   mvhline(1, 0, ACS_HLINE, COLS);
-  std::istringstream lines(text);
+  std::istringstream lines(safe_terminal_text(text));
   std::string line;
   int row = 2;
-  while (row < LINES - 1 && std::getline(lines, line)) {
-    mvaddnstr(row++, 0, line.c_str(), COLS - 1);
+  while (row < LINES - 2 && std::getline(lines, line)) {
+    mvaddnstr(row++, 1, line.c_str(), COLS - 2);
   }
+  mvhline(LINES - 2, 0, ACS_HLINE, COLS);
+  mvaddnstr(LINES - 1, 1, "mtrxAI  |  /help for commands", COLS - 2);
   refresh();
+}
+
+std::vector<std::string> wrap_lines(const std::string& text, int width) {
+  std::vector<std::string> result;
+  std::istringstream input(safe_terminal_text(text));
+  std::string line;
+  width = std::max(1, width);
+  while (std::getline(input, line)) {
+    if (line.empty()) {
+      result.emplace_back();
+      continue;
+    }
+    while (static_cast<int>(line.size()) > width) {
+      int end = width;
+      while (end > 0 &&
+             (static_cast<unsigned char>(line[static_cast<std::size_t>(end)]) &
+              0xc0) == 0x80) {
+        --end;
+      }
+      if (end == 0) end = width;
+      result.push_back(line.substr(0, static_cast<std::size_t>(end)));
+      line.erase(0, static_cast<std::size_t>(end));
+    }
+    result.push_back(std::move(line));
+  }
+  if (result.empty()) result.emplace_back();
+  return result;
+}
+
+bool review(const std::string& text) {
+  const auto lines = wrap_lines(text, std::max(1, COLS - 2));
+  std::size_t offset = 0;
+  const std::size_t page = static_cast<std::size_t>(std::max(1, LINES - 4));
+  while (true) {
+    erase();
+    attron(A_BOLD | (has_colors() ? COLOR_PAIR(2) : 0));
+    mvaddnstr(0, 1, " REVIEW REQUEST", COLS - 2);
+    attroff(A_BOLD | (has_colors() ? COLOR_PAIR(2) : 0));
+    mvhline(1, 0, ACS_HLINE, COLS);
+    for (std::size_t row = 0; row < page && offset + row < lines.size(); ++row) {
+      mvaddnstr(static_cast<int>(row) + 2, 1, lines[offset + row].c_str(),
+                COLS - 2);
+    }
+    mvhline(LINES - 2, 0, ACS_HLINE, COLS);
+    const std::string footer =
+        " ↑/↓ or PgUp/PgDn to review  |  y approve  |  n decline";
+    attron(has_colors() ? COLOR_PAIR(1) : 0);
+    mvaddnstr(LINES - 1, 1, footer.c_str(), COLS - 2);
+    attroff(has_colors() ? COLOR_PAIR(1) : 0);
+    refresh();
+
+    const int key = getch();
+    if (key == 'y' || key == 'Y') return true;
+    if (key == 'n' || key == 'N' || key == 'q' || key == 'Q' || key == 27 ||
+        key == ERR) {
+      return false;
+    }
+    if (key == KEY_DOWN && offset + page < lines.size()) ++offset;
+    if (key == KEY_UP && offset > 0) --offset;
+    if (key == KEY_NPAGE) {
+      offset = std::min(lines.size() - 1, offset + page);
+    }
+    if (key == KEY_PPAGE) {
+      offset = offset > page ? offset - page : 0;
+    }
+  }
 }
 
 void show_roles(const Config& config) {
@@ -44,6 +129,7 @@ void command_help() {
        "  /endpoint ROLE URL              set an OpenAI-compatible API base URL\n"
        "  /keyenv ROLE ENV_NAME           select an API-key environment variable\n"
        "  /gguf ROLE PATH                 set a local GGUF file path\n"
+       "Use Up/Down or PgUp/PgDn to review every proposed file or shell command.\n"
        "  /help                           show this help\n"
        "  /quit                           exit");
 }
@@ -129,12 +215,19 @@ int run_tui(Config& config, const std::filesystem::path& config_file) {
   noecho();
   keypad(stdscr, TRUE);
   curs_set(1);
+  if (has_colors()) {
+    start_color();
+    use_default_colors();
+    init_pair(1, COLOR_GREEN, -1);
+    init_pair(2, COLOR_CYAN, -1);
+  }
 
   Pipeline pipeline(config);
   char buffer[8192];
   while (true) {
     show("Enter a task, or type /help. Completed stage outputs are saved before "
-         "the next model starts.");
+         "the next model starts. The Coder may read files, request approved edits, "
+         "and request approved shell commands.");
     mvprintw(LINES - 1, 0, "> ");
     clrtoeol();
     refresh();
@@ -158,15 +251,7 @@ int run_tui(Config& config, const std::filesystem::path& config_file) {
     try {
       pipeline.run(
           input, [](const std::string& status) { show(status); },
-          [](const std::string& proposal) {
-            show(proposal);
-            mvprintw(LINES - 1, 0, "Apply generated files? [y/N] ");
-            clrtoeol();
-            refresh();
-            char answer[16]{};
-            if (getnstr(answer, 15) == ERR) return false;
-            return answer[0] == 'y' || answer[0] == 'Y';
-          });
+          [](const std::string& proposal) { return review(proposal); });
       show("Pipeline complete. Press any key to enter another task.");
     } catch (const std::exception& error) {
       show(std::string("Pipeline stopped: ") + error.what() +

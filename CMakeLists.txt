@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(mtrxai VERSION 0.1.0 LANGUAGES CXX)
 
+include(CTest)
+
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "mtrxAI currently supports Linux only")
 endif()
@@ -27,3 +29,12 @@ target_link_libraries(mtrxai PRIVATE CURL::libcurl ${CURSES_LIBRARIES} PkgConfig
 target_compile_options(mtrxai PRIVATE -Wall -Wextra -Wpedantic)
 
 install(TARGETS mtrxai RUNTIME DESTINATION bin)
+
+if(BUILD_TESTING)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME pipeline-e2e
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/pipeline_e2e.py
+              $<TARGET_FILE:mtrxai>)
+  endif()
+endif()

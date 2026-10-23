@@ -7,6 +7,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <sys/prctl.h>
 
 namespace {
 
@@ -44,6 +45,10 @@ int main(int argc, char** argv) {
       return 2;
     }
 
+    if (prctl(PR_SET_DUMPABLE, 0) != 0) {
+      throw std::runtime_error(
+          "Could not protect process environment from child commands");
+    }
     const std::filesystem::path config_file = mtrxai::config_path();
     if (!std::filesystem::exists(config_file)) {
       std::cerr << "No configuration found. Run `" << argv[0]

@@ -3,6 +3,7 @@
 #include "mtrxai/config.hpp"
 
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -11,7 +12,21 @@ namespace mtrxai {
 
 using Messages = std::vector<std::pair<std::string, std::string>>;
 
-std::string generate(const ModelSlot& slot, const Messages& messages,
-                     const std::function<void(const std::string&)>& status);
+class InferenceSession {
+ public:
+  using Status = std::function<void(const std::string&)>;
+
+  InferenceSession(const ModelSlot& slot, const Status& status);
+  ~InferenceSession() noexcept;
+  InferenceSession(const InferenceSession&) = delete;
+  InferenceSession& operator=(const InferenceSession&) = delete;
+
+  std::string generate(const Messages& messages);
+  void release();
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
 
 }  // namespace mtrxai

@@ -7,12 +7,12 @@ starting the next model, and asks before applying the Coder's proposed files.
 
 ## Why sequential
 
-Only one local inference is active at a time. Ollama receives `keep_alive: 0`
-for every stage, asking it to unload the model when generation finishes, and
-each local role has a bounded context (`4096` tokens by default). A
-`.gguf` role is served by a short-lived `llama-server` process and stopped after
-its stage. The request, Chief brief, detailed prompt, Coder response, and
-manifest are saved under
+Only one local inference is active at a time. Ollama keeps a role loaded across
+its turns, then mtrxAI explicitly unloads it before starting the next role.
+Chief and Prompter default to a 4096-token context; Coder defaults to 2048. A
+`.gguf` role is served by one short-lived `llama-server` process for its whole
+stage, then stopped before the next role. The request, Chief brief, detailed
+prompt, Coder responses, and manifest are saved under
 `~/.local/state/mtrxai/sessions/<timestamp>/` (or `$XDG_STATE_HOME`). A failure
 in a later stage does not discard earlier work. Existing files overwritten
 after approval are backed up in that session directory.
@@ -21,6 +21,14 @@ The default Prompter is `qwen2.5:3b`: it is small enough for a 16 GB, CPU-only
 machine while being capable of turning a task brief into a structured coding
 prompt. Model choices are defaults, not dependencies; each role can use a
 different Ollama model, an OpenAI-compatible API, or a local GGUF file.
+
+**A single-model-at-a-time strategy reduces peak RAM, but cannot make an
+oversized model fit.** The supplied Mellum Q6 GGUF is about 11 GB; on a 16 GB
+machine it may leave too little memory for the OS and inference runtime. The
+Coder defaults to a 2048-token context to reduce KV-cache usage. If the model
+fails to load or the machine swaps heavily, use a smaller quantization (for
+example Q4_K_M) or select a remote OpenAI-compatible provider. The GGUF is
+never copied or modified by mtrxAI.
 
 ## Build (Linux)
 
@@ -45,8 +53,9 @@ The default assignments are:
 Pull the Ollama models before using them, and install `llama-server` from
 [llama.cpp](https://github.com/ggml-org/llama.cpp) for GGUF inference. The
 coder GGUF path can be changed in `~/.config/mtrxai/config.json` or from the
-TUI. The GGUF server uses a 4096-token context by default and explicitly disables
-GPU layers. Lower a role's `context_size` in the config if memory pressure
+TUI. The GGUF server uses the role's `context_size` (2048 tokens for the
+default Coder) and explicitly disables GPU layers. Lower a role's
+`context_size` in the config if memory pressure
 requires it; increase it only when there is RAM headroom.
 
 ## Providers and hot swapping
@@ -71,13 +80,22 @@ mtrxAI starts it for the Coder stage and terminates it afterward.
 
 ## Applying code
 
-The Coder returns a JSON proposal containing complete file contents. mtrxAI
-validates paths, refuses path traversal and symlinks, shows the proposed files,
-and waits for explicit approval before writing. It never executes generated
-shell commands. It passes a bounded snapshot of project paths and selected
-source/documentation files to the Coder; avoid using remote endpoints for
-workspaces whose contents must remain local. Declining leaves the response
-available in `coder.md`.
+The Coder iteratively lists and reads project files, requests individual file
+writes, and runs relevant checks. Each proposed write and each shell command is
+shown in a paged review screen; nothing is written or executed until you
+explicitly approve it. Reads skip private/secret-like paths, exclude build and
+VCS directories, and return 4 KiB chunks (with offsets) from files up to 2 MiB.
+Commands run from the
+project root with a minimal environment (API keys are not passed to commands);
+they are limited to 300 seconds and 16 KiB of output. File paths
+are checked against traversal and symlink escapes. Replaced files are backed
+up in the private session folder. Generated commands are not run automatically.
+
+mtrxAI saves the Chief and Prompter handoffs and each Coder turn before moving
+on. The Coder gets a bounded project-file listing and inspects relevant source
+on demand. Avoid using remote endpoints for workspaces whose contents must
+remain local. Run the mock-provider integration test with
+`ctest --test-dir build --output-on-failure`.
 
 ## License
 
