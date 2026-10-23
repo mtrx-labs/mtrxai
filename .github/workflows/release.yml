@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to build and publish"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -20,14 +26,18 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --yes cmake g++ libcurl4-openssl-dev libncurses-dev libssl-dev libjson-c-dev pkg-config
       - name: Build release binary
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           project_version="$(sed -n 's/^project(mtrxai VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)"
-          test "${GITHUB_REF_NAME#v}" = "$project_version"
+          test "${RELEASE_TAG#v}" = "$project_version"
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
           cmake --build build --parallel 2
           cp build/mtrxai "mtrxai-linux-${{ matrix.arch }}"
@@ -48,6 +58,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ inputs.release_tag || github.ref }}
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
@@ -60,7 +71,7 @@ jobs:
           path: dist
       - name: Create source archives
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           sudo apt-get update
           sudo apt-get install --yes zip
@@ -74,7 +85,7 @@ jobs:
       - name: Publish GitHub release assets
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" --verify-tag \
@@ -87,6 +98,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - uses: actions/download-artifact@v4
         with:
           name: release-x86_64
@@ -113,12 +126,16 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - uses: actions/download-artifact@v4
         with:
           name: release-x86_64
       - name: Build Arch package
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${RELEASE_TAG#v}"
           mkdir -p package-work/arch dist
           cp packaging/arch/PKGBUILD package-work/arch/PKGBUILD
           cp mtrxai-linux-x86_64 package-work/arch/mtrxai
@@ -146,10 +163,14 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - uses: actions/download-artifact@v4
         with:
           name: release-x86_64
       - name: Build AppImage
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           sudo apt-get update
           sudo apt-get install --yes desktop-file-utils file
@@ -175,7 +196,7 @@ jobs:
             --appdir AppDir --desktop-file AppDir/mtrxai.desktop \
             --icon-file AppDir/usr/share/icons/hicolor/scalable/apps/mtrxai.svg \
             --output appimage
-          mv mtrxai-x86_64.AppImage dist/
+          mv mtrxAI-x86_64.AppImage "dist/mtrxai-${RELEASE_TAG#v}-x86_64.AppImage"
       - uses: actions/upload-artifact@v4
         with:
           name: packages-appimage
