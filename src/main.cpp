@@ -1,5 +1,6 @@
 #include "mtrxai/config.hpp"
 #include "mtrxai/tui.hpp"
+#include "mtrxai/update.hpp"
 
 #include <curl/curl.h>
 
@@ -8,11 +9,17 @@
 #include <stdexcept>
 #include <string>
 #include <sys/prctl.h>
+#include <unistd.h>
+
+#ifndef MTRXAI_VERSION
+#define MTRXAI_VERSION "0.0.0"
+#endif
 
 namespace {
 
 void usage(const char* program) {
-  std::cout << "Usage: " << program << " [--init | --help | --version]\n"
+  std::cout << "Usage: " << program
+            << " [--init | --no-update-check | --help | --version]\n"
             << "Run mtrxAI from the project directory to start the TUI.\n";
 }
 
@@ -20,6 +27,7 @@ void usage(const char* program) {
 
 int main(int argc, char** argv) {
   try {
+    bool skip_update_check = false;
     if (argc > 1) {
       const std::string argument = argv[1];
       if (argument == "--help" || argument == "-h") {
@@ -27,7 +35,7 @@ int main(int argc, char** argv) {
         return 0;
       }
       if (argument == "--version") {
-        std::cout << "mtrxAI 0.1.0\n";
+        std::cout << "mtrxAI " << MTRXAI_VERSION << '\n';
         return 0;
       }
       if (argument == "--init") {
@@ -39,8 +47,12 @@ int main(int argc, char** argv) {
         mtrxai::run_setup_wizard(path);
         return 0;
       }
-      usage(argv[0]);
-      return 2;
+      if (argument == "--no-update-check" && argc == 2) {
+        skip_update_check = true;
+      } else {
+        usage(argv[0]);
+        return 2;
+      }
     }
 
     if (prctl(PR_SET_DUMPABLE, 0) != 0) {
@@ -58,6 +70,9 @@ int main(int argc, char** argv) {
     if (curl_result != CURLE_OK) {
       throw std::runtime_error(std::string("Could not initialize HTTP client: ") +
                                curl_easy_strerror(curl_result));
+    }
+    if (!skip_update_check && isatty(STDIN_FILENO)) {
+      mtrxai::check_and_prompt_for_update(argc, argv);
     }
     auto config = mtrxai::load_config(config_file);
     const int result = mtrxai::run_tui(config, config_file);

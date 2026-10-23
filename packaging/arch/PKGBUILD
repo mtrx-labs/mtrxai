@@ -1,0 +1,16 @@
+pkgname=mtrxai
+pkgver=0.2.1
+pkgrel=1
+pkgdesc="Sequential, low-memory AI coding assistant for Linux"
+arch=('x86_64')
+url="https://github.com/mtrx-labs/mtrxai"
+license=('MIT')
+depends=('curl' 'ncurses' 'openssl' 'json-c')
+options=('!debug')
+source=('mtrxai' 'LICENSE')
+sha256sums=('SKIP' 'SKIP')
+
+package() {
+  install -Dm755 "$srcdir/mtrxai" "$pkgdir/usr/bin/mtrxai"
+  install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/mtrxai/LICENSE"
+}

@@ -90,7 +90,8 @@ def check_setup_wizard(binary, root):
 
         ui_master, ui_slave = pty.openpty()
         ui = subprocess.Popen(
-            [binary], cwd=root, env=env, stdin=ui_slave, stdout=ui_slave, stderr=ui_slave
+            [binary, "--no-update-check"], cwd=root, env=env,
+            stdin=ui_slave, stdout=ui_slave, stderr=ui_slave
         )
         os.close(ui_slave)
         ui_output = bytearray()
@@ -112,14 +113,16 @@ def check_setup_wizard(binary, root):
             ui_output.clear()
 
         try:
-            wait_ui("Enter a task")
-            os.write(ui_master, b"/apikey prompter\n")
+            wait_ui("Describe what you want to build")
+            os.write(ui_master, b"/apikey prompter")
+            wait_ui("/apikey prompter")
+            os.write(ui_master, b"\n")
             wait_ui("API key for prompter")
             os.write(ui_master, b"new-tui-secret\n")
             wait_ui("Saved API key for prompter.")
             assert b"new-tui-secret" not in ui_transcript
             os.write(ui_master, b"x")
-            wait_ui("Enter a task")
+            wait_ui("Describe what you want to build")
             os.write(ui_master, b"/quit\n")
             assert ui.wait(timeout=5) == 0
             assert json.loads(credentials_path.read_text())["prompter"] == (
@@ -283,7 +286,8 @@ def run(binary):
     )
     master, slave = pty.openpty()
     process = subprocess.Popen(
-        [binary], cwd=workspace, env=env, stdin=slave, stdout=slave, stderr=slave
+        [binary, "--no-update-check"], cwd=workspace, env=env,
+        stdin=slave, stdout=slave, stderr=slave
     )
     os.close(slave)
     output = bytearray()
@@ -305,7 +309,7 @@ def run(binary):
             )
 
     try:
-        wait_for("Enter a task")
+        wait_for("Describe what you want to build")
         os.write(master, b"Create and verify a generated file\n")
         output.clear()
         wait_for("Approve this exact file content?")
@@ -343,7 +347,7 @@ def run(binary):
         wait_for("Created generated.txt and verified it with printf.")
         os.write(master, b"\n")
         output.clear()
-        wait_for("Enter a task")
+        wait_for("Describe what you want to build")
         os.write(master, b"/quit\n")
         assert process.wait(timeout=10) == 0
         assert (workspace / "generated.txt").read_text() == "generated-ok\n"

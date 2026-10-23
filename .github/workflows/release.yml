@@ -1,0 +1,183 @@
+name: Linux release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes cmake g++ libcurl4-openssl-dev libncurses-dev libssl-dev libjson-c-dev pkg-config
+      - name: Build release binary
+        run: |
+          project_version="$(sed -n 's/^project(mtrxai VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)"
+          test "${GITHUB_REF_NAME#v}" = "$project_version"
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build build --parallel 2
+          cp build/mtrxai "mtrxai-linux-${{ matrix.arch }}"
+          chmod 755 "mtrxai-linux-${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: mtrxai-linux-${{ matrix.arch }}
+          if-no-files-found: error
+  publish:
+    needs:
+      - build-linux
+      - package-deb-rpm
+      - package-arch
+      - package-appimage
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: dist
+      - name: Create source archives
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes zip
+          mkdir -p dist
+          git archive --format=zip --prefix="mtrxai-${RELEASE_TAG}/" \
+            "$RELEASE_TAG" > "dist/mtrxai-${RELEASE_TAG}-source.zip"
+          git archive --format=tar --prefix="mtrxai-${RELEASE_TAG}/" \
+            "$RELEASE_TAG" | gzip -n > "dist/mtrxai-${RELEASE_TAG}-source.tar.gz"
+          test -s "dist/mtrxai-${RELEASE_TAG}-source.zip"
+          test -s "dist/mtrxai-${RELEASE_TAG}-source.tar.gz"
+      - name: Publish GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag \
+              --title "mtrxAI ${RELEASE_TAG#v}" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+
+  package-deb-rpm:
+    needs: build-linux
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-x86_64
+      - name: Install package tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes cmake g++ libcurl4-openssl-dev libncurses-dev libssl-dev libjson-c-dev pkg-config dpkg-dev rpm
+      - name: Build DEB and RPM packages
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build build --parallel 2
+          cpack --config build/CPackConfig.cmake -G DEB -B dist
+          cpack --config build/CPackConfig.cmake -G RPM -B dist
+          test "$(find dist -maxdepth 1 -type f -name '*.deb' | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -type f -name '*.rpm' | wc -l)" -eq 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-deb-rpm
+          path: dist/*
+          if-no-files-found: error
+
+  package-arch:
+    needs: build-linux
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-x86_64
+      - name: Build Arch package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p package-work/arch dist
+          cp packaging/arch/PKGBUILD package-work/arch/PKGBUILD
+          cp mtrxai-linux-x86_64 package-work/arch/mtrxai
+          cp LICENSE package-work/arch/LICENSE
+          sed -i "s/^pkgver=.*/pkgver=${version}/" package-work/arch/PKGBUILD
+          docker run --rm \
+            -v "$PWD/package-work/arch:/pkg" \
+            -v "$PWD/dist:/out" \
+            archlinux:latest bash -lc '
+              pacman -Syu --noconfirm --needed base-devel curl ncurses openssl json-c &&
+              useradd --create-home builder &&
+              chown -R builder:builder /pkg /out &&
+              su builder -c "cd /pkg && makepkg --noconfirm --cleanbuild" &&
+              mv /pkg/*.pkg.tar.zst /out/
+            '
+          find dist -maxdepth 1 -type f -name '*.pkg.tar.zst' -print -quit | grep .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-arch
+          path: dist/*.pkg.tar.zst
+          if-no-files-found: error
+
+  package-appimage:
+    needs: build-linux
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-x86_64
+      - name: Build AppImage
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes desktop-file-utils file
+          mkdir -p AppDir/usr/bin AppDir/usr/share/icons/hicolor/scalable/apps dist
+          install -m755 mtrxai-linux-x86_64 AppDir/usr/bin/mtrxai
+          install -m644 packaging/mtrxai.svg \
+            AppDir/usr/share/icons/hicolor/scalable/apps/mtrxai.svg
+          cat > AppDir/mtrxai.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=mtrxAI
+          Comment=Sequential low-memory AI coding assistant
+          Exec=mtrxai
+          Terminal=true
+          Categories=Development;Utility;
+          Icon=mtrxai
+          EOF
+          curl --fail --location --silent --show-error \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage \
+            --output linuxdeploy.AppImage
+          chmod +x linuxdeploy.AppImage
+          ./linuxdeploy.AppImage --appimage-extract-and-run \
+            --appdir AppDir --desktop-file AppDir/mtrxai.desktop \
+            --icon-file AppDir/usr/share/icons/hicolor/scalable/apps/mtrxai.svg \
+            --output appimage
+          mv mtrxai-x86_64.AppImage dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-appimage
+          path: dist/*.AppImage
+          if-no-files-found: error

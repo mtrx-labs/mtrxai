@@ -31,8 +31,8 @@ never copied or modified by mtrxAI.
 
 ## Build (Linux)
 
-Dependencies: C++17 compiler, CMake 3.20+, ncurses, libcurl, json-c, and
-pkg-config.
+Dependencies: C++17 compiler, CMake 3.20+, ncurses, libcurl, OpenSSL, json-c,
+and pkg-config.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -50,6 +50,44 @@ Keys are saved separately in `credentials.json` beside the config (by default
 written to `config.json`. This local credentials file is plaintext protected
 by filesystem permissions, so protect your account and backups accordingly.
 Existing environment-variable keys (`api_key_env`) remain supported.
+
+## Updates
+
+When started from an interactive terminal, mtrxAI checks GitHub for a newer
+stable release and asks before installing it. Downloads are HTTPS-only and must
+match the SHA-256 digest published in GitHub release metadata. On confirmation,
+the new binary is installed atomically and mtrxAI restarts itself with the
+current command-line arguments. Configuration, credentials, and saved
+conversation/session history live outside the executable and are left intact.
+Use `mtrxai --no-update-check` to skip the check for one launch.
+
+Automatic installation replaces the running executable when its directory is
+writable. Otherwise, it installs to `~/.local/bin/mtrxai` and restarts from
+there; add `~/.local/bin` to your `PATH` to use that copy on subsequent
+launches. Linux x86_64 and AArch64 release assets are published when a `v*`
+version tag matching the CMake project version is created. Each release also
+attaches explicit source archives named `mtrxai-<tag>-source.zip` and
+`mtrxai-<tag>-source.tar.gz` in addition to GitHub's automatic source links.
+
+## Linux packages
+
+Prebuilt releases include `.deb` (Debian/Ubuntu), `.rpm` (Fedora/RHEL/openSUSE),
+`.pkg.tar.zst` (Arch Linux), and x86_64 `.AppImage` downloads. Install the
+distribution package with its normal package manager, for example:
+
+```sh
+sudo apt install ./mtrxai-*.deb
+sudo dnf install ./mtrxai-*.rpm
+sudo pacman -U ./mtrxai-*.pkg.tar.zst
+```
+
+DEB, RPM, and Arch packages install the executable as `/usr/bin/mtrxai`, so
+after installation launch it by running `mtrxai` from a terminal. The AppImage
+is portable and does not install into `PATH`; make it executable and launch its
+downloaded file directly. The packages install only the application and its
+runtime dependencies; per-user configuration, API credentials, and session
+history are stored in the user's home directories and are not removed during
+package upgrades or uninstallation.
 
 Install `llama-server` from [llama.cpp](https://github.com/ggml-org/llama.cpp)
 for GGUF inference and pull any configured Ollama models before using them.
