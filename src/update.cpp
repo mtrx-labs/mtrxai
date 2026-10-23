@@ -66,6 +66,16 @@ struct Download {
   std::string error;
 };
 
+void restrict_to_https(CURL* curl) {
+#if LIBCURL_VERSION_NUM >= 0x075500
+  curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+  curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+#else
+  curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
+  curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
+#endif
+}
+
 std::size_t write_download(char* data, std::size_t size, std::size_t count,
                            void* userdata) {
   auto& download = *static_cast<Download*>(userdata);
@@ -103,8 +113,7 @@ Buffer get_https(const std::string& url, bool allow_not_found = false) {
   curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
   curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
-  curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
-  curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+  restrict_to_https(curl);
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 8L);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receive_buffer);
@@ -272,8 +281,7 @@ void install_asset(const std::string& url, const std::string& expected_digest,
   curl_easy_setopt(curl, CURLOPT_USERAGENT, "mtrxAI-updater");
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
   curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
-  curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
-  curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+  restrict_to_https(curl);
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_download);
