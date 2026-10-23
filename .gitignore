@@ -1,14 +1,3 @@
-.venv/
-__pycache__/
-*.pyc
-*.egg-info/
-build/
-dist/
-.env
-logs/
-workspace/*
-!workspace/.gitkeep
-.pytest_cache/
-.zwork/
-# root-level duplicate of assets/wake/mtrxAI.onnx
-/mtrxAI.onnx
+/build/
+/cmake-build-*/
+*.swp
