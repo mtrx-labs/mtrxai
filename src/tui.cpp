@@ -116,8 +116,12 @@ void show_roles(const Config& config) {
   for (const auto* name : {"chief", "prompter", "coder"}) {
     const std::string role(name);
     const auto& slot = find_slot(config, role);
+    const std::string model =
+        slot.model.empty() ? (slot.gguf_path.empty() ? "(GGUF path not configured)"
+                                                     : slot.gguf_path)
+                           : slot.model;
     text << slot.name << ": " << slot.provider << " / "
-         << (slot.model.empty() ? slot.gguf_path : slot.model) << '\n';
+         << model << '\n';
   }
   show(text.str());
 }
@@ -225,9 +229,15 @@ int run_tui(Config& config, const std::filesystem::path& config_file) {
   Pipeline pipeline(config);
   char buffer[8192];
   while (true) {
-    show("Enter a task, or type /help. Completed stage outputs are saved before "
-         "the next model starts. The Coder may read files, request approved edits, "
-         "and request approved shell commands.");
+    std::string welcome =
+        "Enter a task, or type /help. Completed stage outputs are saved before "
+        "the next model starts. The Coder may read files, request approved edits, "
+        "and request approved shell commands.";
+    if (config.coder.provider == "gguf" && config.coder.gguf_path.empty()) {
+      welcome += "\nCoder GGUF path is unset. Use /gguf coder /path/to/your/model.gguf "
+                 "to configure your local model.";
+    }
+    show(welcome);
     mvprintw(LINES - 1, 0, "> ");
     clrtoeol();
     refresh();

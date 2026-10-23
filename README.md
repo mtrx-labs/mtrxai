@@ -48,12 +48,14 @@ The default assignments are:
 |---|---|
 | Chief of Staff | Ollama `deepseek-r1:8b` |
 | Prompter | Ollama `qwen2.5:3b` |
-| Coder | `~/cooking/Mellum2.1-12B-A2.5B-Thinking-Q6_K.gguf` via llama.cpp |
+| Coder | GGUF via llama.cpp (choose your local model path) |
 
 Pull the Ollama models before using them, and install `llama-server` from
 [llama.cpp](https://github.com/ggml-org/llama.cpp) for GGUF inference. The
-coder GGUF path can be changed in `~/.config/mtrxai/config.json` or from the
-TUI. The GGUF server uses the role's `context_size` (2048 tokens for the
+coder GGUF path is intentionally blank on first run: set `coder.gguf_path` in
+`~/.config/mtrxai/config.json` or enter `/gguf coder /path/to/your/model.gguf`
+in the TUI. No user's home directory or model location is assumed. The GGUF
+server uses the role's `context_size` (2048 tokens for the
 default Coder) and explicitly disables GPU layers. Lower a role's
 `context_size` in the config if memory pressure
 requires it; increase it only when there is RAM headroom.
@@ -66,7 +68,7 @@ Edit `~/.config/mtrxai/config.json` or use TUI commands:
 /roles
 /model chief ollama deepseek-r1:8b
 /model prompter ollama qwen2.5:3b
-/gguf coder ~/cooking/Mellum2.1-12B-A2.5B-Thinking-Q6_K.gguf
+/gguf coder /path/to/your/Mellum2.1-12B-A2.5B-Thinking-Q6_K.gguf
 /endpoint coder https://api.example.com/v1
 /keyenv coder MY_API_KEY
 ```

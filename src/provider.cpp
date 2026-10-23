@@ -313,6 +313,12 @@ struct InferenceSession::Impl {
       return;
     }
     if (slot.provider == "gguf") {
+      if (slot.gguf_path.empty()) {
+        throw std::runtime_error(
+            "No GGUF file is configured for " + slot.name +
+            ". Set gguf_path in config.json or use `/gguf " + slot.name +
+            " /path/to/model.gguf` in the TUI.");
+      }
       llama_server = std::make_unique<LlamaServer>(slot, status);
       endpoint = llama_server->endpoint();
       return;

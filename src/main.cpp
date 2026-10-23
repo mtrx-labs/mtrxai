@@ -38,7 +38,8 @@ int main(int argc, char** argv) {
         }
         mtrxai::save_config(mtrxai::default_config(), path);
         std::cout << "Created " << path << '\n'
-                  << "Set the coder GGUF path if needed, then run mtrxai.\n";
+                  << "Set coder.gguf_path in this file, or use `/gguf coder PATH` "
+                     "in the TUI.\n";
         return 0;
       }
       usage(argv[0]);

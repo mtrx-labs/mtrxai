@@ -74,9 +74,6 @@ ModelSlot parse_slot(const char* name, json_object* root) {
   if (slot.model.empty() && slot.provider != "gguf") {
     throw std::runtime_error("Model name is required for " + slot.name);
   }
-  if (slot.provider == "gguf" && slot.gguf_path.empty()) {
-    throw std::runtime_error("GGUF path is required for " + slot.name);
-  }
   if (slot.context_size < 512 || slot.context_size > 32768) {
     throw std::runtime_error("context_size for " + slot.name +
                              " must be between 512 and 32768");
@@ -99,21 +96,13 @@ std::filesystem::path config_path() {
 }
 
 Config default_config() {
-  const char* home = std::getenv("HOME");
-  if (home == nullptr || *home == '\0') {
-    throw std::runtime_error("HOME is not set; cannot create default configuration");
-  }
-
   Config config;
   config.chief = {"chief", "ollama", "deepseek-r1:8b", "http://localhost:11434",
                   "", "", 4096};
   config.prompter = {"prompter", "ollama", "qwen2.5:3b",
                      "http://localhost:11434", "", "", 4096};
   config.coder = {"coder", "gguf", "", "http://127.0.0.1",
-                  "", (std::filesystem::path(home) / "cooking" /
-                       "Mellum2.1-12B-A2.5B-Thinking-Q6_K.gguf")
-                          .string(),
-                  2048};
+                  "", "", 2048};
   return config;
 }
 

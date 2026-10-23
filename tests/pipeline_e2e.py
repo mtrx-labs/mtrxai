@@ -14,8 +14,48 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
+def check_portable_default_config(binary, root):
+    config_home = root / "portable-config"
+    user_home = root / "different-user-home"
+    user_home.mkdir()
+    env = os.environ.copy()
+    env.update({"HOME": str(user_home), "XDG_CONFIG_HOME": str(config_home)})
+    result = subprocess.run(
+        [binary, "--init"], env=env, text=True, capture_output=True, check=True
+    )
+    assert "coder.gguf_path" in result.stdout
+    config_path = config_home / "mtrxai" / "config.json"
+    config = json.loads(config_path.read_text())
+    assert config["coder"]["provider"] == "gguf"
+    assert config["coder"]["gguf_path"] == ""
+    assert str(user_home) not in config_path.read_text()
+
+    master, slave = pty.openpty()
+    process = subprocess.Popen(
+        [binary], cwd=root, env={**env, "TERM": "xterm"},
+        stdin=slave, stdout=slave, stderr=slave,
+    )
+    os.close(slave)
+    output = bytearray()
+    try:
+        deadline = time.time() + 10
+        while b"Coder GGUF path is unset" not in output and time.time() < deadline:
+            readable, _, _ = select.select([master], [], [], 0.2)
+            if readable:
+                output.extend(os.read(master, 8192))
+        assert b"Coder GGUF path is unset" in output, output.decode(errors="replace")
+        os.write(master, b"/quit\n")
+        assert process.wait(timeout=5) == 0
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=3)
+        os.close(master)
+
+
 def run(binary):
     temp = Path(tempfile.mkdtemp(prefix="mtrxai-e2e-"))
+    check_portable_default_config(binary, temp)
     workspace = temp / "workspace"
     outside = temp / "outside"
     config_home = temp / "config"
