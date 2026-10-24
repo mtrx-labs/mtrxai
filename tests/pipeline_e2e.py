@@ -396,6 +396,10 @@ def run(binary):
             pass
         else:
             raise AssertionError("llama-server remained running after the Coder stage")
+        coder_log_file = state_home / "mtrxai" / "logs" / "coder.log"
+        assert coder_log_file.exists(), f"Missing llama log at {coder_log_file}"
+        assert stat.S_IMODE(coder_log_file.stat().st_mode) == 0o600
+        assert "mock llama-server started" in coder_log_file.read_text()
         session_dirs = list((state_home / "mtrxai" / "sessions").iterdir())
         assert len(session_dirs) == 1
         session = session_dirs[0]

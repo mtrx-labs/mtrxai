@@ -135,7 +135,9 @@ up in the private session folder. Generated commands are not run automatically.
 
 mtrxAI saves the Chief and Prompter handoffs and each Coder turn before moving
 on. The Coder gets a bounded project-file listing and inspects relevant source
-on demand. Avoid using remote endpoints for workspaces whose contents must
+on demand. When running local GGUF models, `llama-server` stdout and stderr are
+redirected to `$XDG_STATE_HOME/mtrxai/logs/<role>.log` (mode 0600) to keep the TUI
+display clean. Avoid using remote endpoints for workspaces whose contents must
 remain local. Run the mock-provider integration test with
 `ctest --test-dir build --output-on-failure`.
 

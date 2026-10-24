@@ -2,6 +2,14 @@
 #include <doctest/doctest.h>
 
 #include "mtrxai/pipeline.hpp"
+#include "mtrxai/provider.hpp"
+
+TEST_CASE("llama_log_path uses state home and role") {
+  const std::string path = mtrxai::llama_log_path("coder").string();
+  CHECK(path.find("mtrxai/logs/coder.log") != std::string::npos);
+  const std::string chief_path = mtrxai::llama_log_path("chief").string();
+  CHECK(chief_path.find("mtrxai/logs/chief.log") != std::string::npos);
+}
 
 TEST_CASE("sensitive_filename blocks exact sensitive names") {
   CHECK(mtrxai::sensitive_filename(".env"));

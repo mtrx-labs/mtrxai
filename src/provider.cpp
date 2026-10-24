@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
+#include <fcntl.h>
+#include <filesystem>
 #include <memory>
 #include <netinet/in.h>
 #include <stdexcept>
@@ -22,6 +24,22 @@
 #include <vector>
 
 namespace mtrxai {
+
+std::filesystem::path llama_log_path(const std::string& role) {
+  const char* xdg = std::getenv("XDG_STATE_HOME");
+  std::filesystem::path root;
+  if (xdg != nullptr && *xdg != '\0') {
+    root = std::filesystem::path(xdg) / "mtrxai" / "logs";
+  } else {
+    const char* home = std::getenv("HOME");
+    if (home == nullptr || *home == '\0') {
+      throw std::runtime_error("HOME is not set; cannot locate logs directory");
+    }
+    root = std::filesystem::path(home) / ".local" / "state" / "mtrxai" / "logs";
+  }
+  return root / (role + ".log");
+}
+
 namespace {
 
 struct JsonDeleter {
@@ -263,12 +281,35 @@ class LlamaServer {
     if (access(slot.gguf_path.c_str(), R_OK) != 0) {
       throw std::runtime_error("GGUF file is not readable: " + slot.gguf_path);
     }
+    const std::string role = slot.name.empty() ? "llama-server" : slot.name;
+    const auto log_file = llama_log_path(role);
+    std::error_code error;
+    std::filesystem::create_directories(log_file.parent_path(), error);
+    if (error) {
+      throw std::runtime_error("Could not create logs directory: " + error.message());
+    }
     status("Starting llama-server (one local model at a time)...");
     pid_ = fork();
     if (pid_ < 0) throw std::runtime_error("Could not start llama-server");
     if (pid_ == 0) {
       if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) _exit(126);
       if (getppid() == 1) _exit(1);
+
+      // Redirect stdout and stderr to the role log file so ncurses is not corrupted
+      const int log_fd = open(log_file.c_str(), O_CREAT | O_WRONLY | O_APPEND, 0600);
+      if (log_fd >= 0) {
+        dup2(log_fd, STDOUT_FILENO);
+        dup2(log_fd, STDERR_FILENO);
+        close(log_fd);
+      } else {
+        const int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+          dup2(devnull, STDOUT_FILENO);
+          dup2(devnull, STDERR_FILENO);
+          close(devnull);
+        }
+      }
+
       const std::string port = std::to_string(port_);
       const std::string context = std::to_string(slot.context_size);
       execlp("llama-server", "llama-server", "--model", slot.gguf_path.c_str(),

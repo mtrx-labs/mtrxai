@@ -13,6 +13,9 @@ def argument(name):
 with open(os.environ["MTRXAI_TEST_LLAMA_STARTS"], "a", encoding="utf-8") as log:
     log.write(json.dumps({"args": sys.argv[1:], "pid": os.getpid()}) + "\n")
 
+sys.stderr.write("mock llama-server started\n")
+sys.stderr.flush()
+
 upstream = os.environ["MTRXAI_TEST_UPSTREAM"]
 
 

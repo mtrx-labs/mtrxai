@@ -2,6 +2,7 @@
 
 #include "mtrxai/config.hpp"
 
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
@@ -11,6 +12,8 @@
 namespace mtrxai {
 
 using Messages = std::vector<std::pair<std::string, std::string>>;
+
+std::filesystem::path llama_log_path(const std::string& role);
 
 class InferenceSession {
  public:
