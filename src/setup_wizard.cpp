@@ -83,10 +83,10 @@ std::string prompt_line(const std::string& label, const std::string& fallback = 
 
 std::string prompt_secret(const std::string& label) {
   while (true) {
-    std::cout << label << ": " << std::flush;
     std::string value;
     {
       EchoGuard guard(true);
+      std::cout << label << ": " << std::flush;
       if (!std::getline(std::cin, value)) {
         std::cout << '\n';
         throw std::runtime_error("Setup cancelled before configuration was saved");
