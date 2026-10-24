@@ -158,7 +158,7 @@ def run(binary):
     gguf_path.write_bytes(b"test model placeholder")
 
     actions = [
-        "Chief brief: create and verify a generated file.",
+        "<think>Chief thinking process</think>Chief brief: create and verify a generated file.",
         "Prompter brief: inspect, edit, test, and summarize.",
         {"action": "list_files", "path": "."},
         {"action": "read_file", "path": "existing.txt"},
@@ -366,8 +366,13 @@ def run(binary):
         assert headers["anthropic-version"] == "2023-06-01"
         assert requests[0]["body"]["model"] == "chief-test"
         assert requests[0]["body"]["system"]
+        assert requests[0]["body"]["max_tokens"] == 4096
         assert requests[1]["body"]["keep_alive"] == "30s"
+        assert requests[1]["body"]["options"]["num_predict"] == 4096
         assert requests[2]["body"]["keep_alive"] == 0
+        assert "Chief thinking process" not in json.dumps(requests[1]["body"]["messages"])
+        assert "<think>" not in json.dumps(requests[1]["body"]["messages"])
+        assert generated_requests[0]["body"]["max_tokens"] == 4096
         assert "existing.txt" in json.dumps(generated_requests[1]["body"]["messages"])
         assert "original file" in json.dumps(generated_requests[2]["body"]["messages"])
         assert "sensitive file" in json.dumps(generated_requests[3]["body"]["messages"])
@@ -405,6 +410,9 @@ def run(binary):
         session = session_dirs[0]
         assert (session / "request.md").exists()
         assert (session / "chief.md").exists()
+        assert (session / "chief_thinking.md").exists()
+        assert (session / "chief_thinking.md").read_text().strip() == "Chief thinking process"
+        assert "<think>" not in (session / "chief.md").read_text()
         assert (session / "prompt.md").exists()
         coder_log = (session / "coder.md").read_text()
         assert "Created generated.txt and verified it with printf." in coder_log, coder_log

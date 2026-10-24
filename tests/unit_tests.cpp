@@ -75,3 +75,44 @@ TEST_CASE("sensitive_filename allows standard project files") {
   CHECK_FALSE(mtrxai::sensitive_filename("Makefile"));
   CHECK_FALSE(mtrxai::sensitive_filename("index.ts"));
 }
+
+TEST_CASE("extract_thinking separates reasoning from answer") {
+  SUBCASE("standard think block") {
+    const auto res = mtrxai::extract_thinking(
+        "<think>\nI need to analyze this.\n</think>\nHere is the answer.");
+    CHECK(res.thinking == "I need to analyze this.");
+    CHECK(res.content == "Here is the answer.");
+  }
+
+  SUBCASE("case-insensitive think tags") {
+    const auto res = mtrxai::extract_thinking(
+        "<THINK>Capital reasoning</THINK>Answer text");
+    CHECK(res.thinking == "Capital reasoning");
+    CHECK(res.content == "Answer text");
+  }
+
+  SUBCASE("multiple think blocks") {
+    const auto res = mtrxai::extract_thinking(
+        "<think>First thought</think>Middle<think>Second thought</think>End");
+    CHECK(res.thinking == "First thought\n\nSecond thought");
+    CHECK(res.content == "MiddleEnd");
+  }
+
+  SUBCASE("unclosed think block") {
+    const auto res = mtrxai::extract_thinking("<think>Only thinking never finished");
+    CHECK(res.thinking == "Only thinking never finished");
+    CHECK(res.content.empty());
+  }
+
+  SUBCASE("no thinking tags") {
+    const auto res = mtrxai::extract_thinking("Direct response with no tags");
+    CHECK(res.thinking.empty());
+    CHECK(res.content == "Direct response with no tags");
+  }
+}
+
+TEST_CASE("ModelSlot defaults max_tokens to 4096") {
+  mtrxai::ModelSlot slot;
+  CHECK(slot.max_tokens == 4096);
+}
+

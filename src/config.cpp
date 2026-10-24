@@ -34,6 +34,8 @@ Json slot_json(const ModelSlot& slot) {
                          json_object_new_string(slot.gguf_path.c_str()));
   json_object_object_add(result.get(), "context_size",
                          json_object_new_int(slot.context_size));
+  json_object_object_add(result.get(), "max_tokens",
+                         json_object_new_int(slot.max_tokens));
   return result;
 }
 
@@ -66,6 +68,11 @@ ModelSlot parse_slot(const char* name, json_object* root) {
       json_object_is_type(context, json_type_int)) {
     slot.context_size = json_object_get_int(context);
   }
+  json_object* max_tokens = nullptr;
+  if (json_object_object_get_ex(object, "max_tokens", &max_tokens) &&
+      json_object_is_type(max_tokens, json_type_int)) {
+    slot.max_tokens = json_object_get_int(max_tokens);
+  }
 
   if (slot.provider != "ollama" && slot.provider != "openai" &&
       slot.provider != "anthropic" && slot.provider != "gguf") {
@@ -78,6 +85,10 @@ ModelSlot parse_slot(const char* name, json_object* root) {
   if (slot.context_size < 512 || slot.context_size > 32768) {
     throw std::runtime_error("context_size for " + slot.name +
                              " must be between 512 and 32768");
+  }
+  if (slot.max_tokens < 1 || slot.max_tokens > 131072) {
+    throw std::runtime_error("max_tokens for " + slot.name +
+                             " must be between 1 and 131072");
   }
   return slot;
 }

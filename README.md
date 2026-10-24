@@ -135,7 +135,11 @@ up in the private session folder. Generated commands are not run automatically.
 
 mtrxAI saves the Chief and Prompter handoffs and each Coder turn before moving
 on. The Coder gets a bounded project-file listing and inspects relevant source
-on demand. When running local GGUF models, `llama-server` stdout and stderr are
+on demand. Each model role configures `max_tokens` (`num_predict` in Ollama).
+Model `<think>...</think>` blocks are stripped before passing outputs to downstream
+roles to prevent context pollution, and reasoning is saved in separate session
+artifacts (`chief_thinking.md`, `prompt_thinking.md`, `coder_turn_<N>_thinking.md`).
+When running local GGUF models, `llama-server` stdout and stderr are
 redirected to `$XDG_STATE_HOME/mtrxai/logs/<role>.log` (mode 0600) to keep the TUI
 display clean. Avoid using remote endpoints for workspaces whose contents must
 remain local. Run the mock-provider integration test with

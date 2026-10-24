@@ -14,6 +14,7 @@ struct ModelSlot {
   std::string api_key;
   std::string gguf_path;
   int context_size = 2048;
+  int max_tokens = 4096;
 };
 
 struct Config {

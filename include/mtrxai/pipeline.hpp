@@ -12,6 +12,15 @@ namespace mtrxai {
 // not be read, listed, or written by the automated coder.
 bool sensitive_filename(const std::string& name);
 
+struct ThinkingResult {
+  std::string content;
+  std::string thinking;
+};
+
+// Strips <think>...</think> blocks from text and returns both the clean content
+// and any extracted thinking/reasoning text.
+ThinkingResult extract_thinking(const std::string& text);
+
 class Pipeline {
  public:
   using Status = std::function<void(const std::string&)>;

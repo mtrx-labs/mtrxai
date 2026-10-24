@@ -153,6 +153,10 @@ std::string ollama_generate(const ModelSlot& slot, const Messages& messages,
   Json options(json_object_new_object());
   json_object_object_add(options.get(), "num_ctx",
                          json_object_new_int(slot.context_size));
+  if (slot.max_tokens > 0) {
+    json_object_object_add(options.get(), "num_predict",
+                           json_object_new_int(slot.max_tokens));
+  }
   json_object_object_add(body.get(), "options", options.release());
   const auto response =
       post_json(base_url + "/api/chat",
@@ -178,6 +182,10 @@ std::string openai_generate(const ModelSlot& slot, const Messages& messages,
   Json parsed_messages(json_tokener_parse(messages_json(messages).c_str()));
   json_object_object_add(body.get(), "messages", parsed_messages.release());
   json_object_object_add(body.get(), "stream", json_object_new_boolean(false));
+  if (slot.max_tokens > 0) {
+    json_object_object_add(body.get(), "max_tokens",
+                           json_object_new_int(slot.max_tokens));
+  }
   const auto response =
       post_json(base_url + "/chat/completions",
                 json_object_to_json_string_ext(body.get(), JSON_C_TO_STRING_PLAIN),
@@ -205,7 +213,8 @@ std::string anthropic_generate(const ModelSlot& slot, const Messages& messages,
   Json body(json_object_new_object());
   json_object_object_add(body.get(), "model",
                          json_object_new_string(slot.model.c_str()));
-  json_object_object_add(body.get(), "max_tokens", json_object_new_int(4096));
+  json_object_object_add(body.get(), "max_tokens",
+                         json_object_new_int(slot.max_tokens > 0 ? slot.max_tokens : 4096));
   Json request_messages(json_object_new_array());
   std::string system_prompt;
   for (const auto& [role, content] : messages) {

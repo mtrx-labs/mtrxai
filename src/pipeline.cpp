@@ -65,6 +65,64 @@ bool sensitive_filename(const std::string& name) {
   return false;
 }
 
+ThinkingResult extract_thinking(const std::string& text) {
+  ThinkingResult result;
+  std::size_t pos = 0;
+  const std::string open_tag = "<think>";
+  const std::string close_tag = "</think>";
+
+  auto find_ci = [](const std::string& haystack, const std::string& needle,
+                    std::size_t start) {
+    if (needle.empty() || start >= haystack.size()) return std::string::npos;
+    auto it = std::search(
+        haystack.begin() + start, haystack.end(), needle.begin(), needle.end(),
+        [](char c1, char c2) {
+          return std::tolower(static_cast<unsigned char>(c1)) ==
+                 std::tolower(static_cast<unsigned char>(c2));
+        });
+    if (it == haystack.end()) return std::string::npos;
+    return static_cast<std::size_t>(std::distance(haystack.begin(), it));
+  };
+
+  while (pos < text.size()) {
+    const std::size_t open_pos = find_ci(text, open_tag, pos);
+    if (open_pos == std::string::npos) {
+      result.content.append(text.substr(pos));
+      break;
+    }
+    result.content.append(text.substr(pos, open_pos - pos));
+    const std::size_t think_start = open_pos + open_tag.size();
+    const std::size_t close_pos = find_ci(text, close_tag, think_start);
+    if (close_pos == std::string::npos) {
+      const std::string block = text.substr(think_start);
+      if (!block.empty()) {
+        if (!result.thinking.empty()) result.thinking += "\n\n";
+        result.thinking += block;
+      }
+      pos = text.size();
+      break;
+    } else {
+      const std::string block = text.substr(think_start, close_pos - think_start);
+      if (!block.empty()) {
+        if (!result.thinking.empty()) result.thinking += "\n\n";
+        result.thinking += block;
+      }
+      pos = close_pos + close_tag.size();
+    }
+  }
+
+  auto trim = [](std::string s) {
+    const auto first = s.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return std::string();
+    const auto last = s.find_last_not_of(" \t\r\n");
+    return s.substr(first, last - first + 1);
+  };
+
+  result.content = trim(result.content);
+  result.thinking = trim(result.thinking);
+  return result;
+}
+
 namespace {
 
 struct JsonDeleter {
@@ -576,31 +634,39 @@ void Pipeline::run(const std::string& request, const Status& status,
   save_manifest(session, "request");
 
   status("Chief of Staff: " + config_.chief.model);
-  std::string chief;
+  std::string chief_raw;
   {
     InferenceSession model(config_.chief, status);
-    chief = model.generate({{"system", chief_instructions()}, {"user", request}});
+    chief_raw = model.generate({{"system", chief_instructions()}, {"user", request}});
     model.release();
   }
-  write_atomic(session / "chief.md", chief);
+  const auto chief = extract_thinking(chief_raw);
+  if (!chief.thinking.empty()) {
+    write_atomic(session / "chief_thinking.md", chief.thinking);
+  }
+  write_atomic(session / "chief.md", chief.content);
   save_manifest(session, "chief");
 
   const std::string prompt_input = "Original user request:\n" + request +
-                                   "\n\nChief of Staff brief:\n" + chief;
+                                   "\n\nChief of Staff brief:\n" + chief.content;
   status("Prompter: " + config_.prompter.model);
-  std::string prompt;
+  std::string prompt_raw;
   {
     InferenceSession model(config_.prompter, status);
-    prompt = model.generate(
+    prompt_raw = model.generate(
         {{"system", prompter_instructions()}, {"user", prompt_input}});
     model.release();
   }
-  write_atomic(session / "prompt.md", prompt);
+  const auto prompt = extract_thinking(prompt_raw);
+  if (!prompt.thinking.empty()) {
+    write_atomic(session / "prompt_thinking.md", prompt.thinking);
+  }
+  write_atomic(session / "prompt.md", prompt.content);
   save_manifest(session, "prompter");
 
   const std::string coding_input =
       "Original user request:\n" + request + "\n\nDetailed implementation prompt:\n" +
-      prompt + "\n\n" + workspace_snapshot(root);
+      prompt.content + "\n\n" + workspace_snapshot(root);
   status("Coder: " + (config_.coder.model.empty() ? config_.coder.gguf_path
                                                    : config_.coder.model));
   Messages coder_messages = {{"system", coder_instructions()},
@@ -614,16 +680,22 @@ void Pipeline::run(const std::string& request, const Status& status,
                            coder_messages.begin() + 4);
     }
     status("Coder turn " + std::to_string(turn) + " of 40");
-    const std::string response = coder_model.generate(coder_messages);
-    coder_messages.emplace_back("assistant", response);
+    const std::string response_raw = coder_model.generate(coder_messages);
+    const auto response = extract_thinking(response_raw);
+    coder_messages.emplace_back("assistant", response.content);
     coder_log += "## Turn " + std::to_string(turn) + "\n\n";
-    coder_log += "### Coder response\n\n" + response + "\n\n";
+    if (!response.thinking.empty()) {
+      coder_log += "### Thinking\n\n" + response.thinking + "\n\n";
+      write_atomic(session / ("coder_turn_" + std::to_string(turn) + "_thinking.md"),
+                   response.thinking);
+    }
+    coder_log += "### Coder response\n\n" + response.content + "\n\n";
     write_atomic(session / "coder.md", coder_log);
     save_manifest(session, "coder-turn-" + std::to_string(turn));
 
     std::string tool_result;
     try {
-      const CoderAction action = parse_action(response);
+      const CoderAction action = parse_action(response.content);
       if (action.name == "finish") {
         tool_result = action.summary.empty() ? "Coder finished." : action.summary;
         coder_log += "### Finished\n\n" + tool_result + "\n";
