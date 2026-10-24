@@ -31,6 +31,40 @@
 #include <unistd.h>
 
 namespace mtrxai {
+
+bool sensitive_filename(const std::string& name) {
+  // Extract base filename in case a relative path was passed
+  const std::string filename = std::filesystem::path(name).filename().string();
+  std::string lower = filename;
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char character) {
+                   return static_cast<char>(std::tolower(character));
+                 });
+
+  // Exact sensitive names
+  if (lower == ".env" || lower == ".netrc" || lower == ".npmrc" ||
+      lower == ".pypirc" || lower == "credentials.json") {
+    return true;
+  }
+
+  // Sensitive prefix patterns (.env.*, id_rsa*, id_ed25519*)
+  if (lower.rfind(".env.", 0) == 0 || lower.rfind("id_rsa", 0) == 0 ||
+      lower.rfind("id_ed25519", 0) == 0) {
+    return true;
+  }
+
+  // Sensitive suffix patterns (*.pem, *.key, *.p12, *.pfx)
+  for (const auto* suffix : {".pem", ".key", ".p12", ".pfx"}) {
+    const std::size_t suffix_len = std::strlen(suffix);
+    if (lower.size() >= suffix_len &&
+        lower.compare(lower.size() - suffix_len, suffix_len, suffix) == 0) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 namespace {
 
 struct JsonDeleter {
@@ -117,28 +151,6 @@ struct CoderAction {
   std::uint64_t offset = 0;
 };
 
-bool sensitive_filename(const std::string& name) {
-  std::string lower = name;
-  std::transform(lower.begin(), lower.end(), lower.begin(),
-                 [](unsigned char character) {
-                   return static_cast<char>(std::tolower(character));
-                 });
-  for (const auto* term : {"secret", "credential", "token", "password", "apikey",
-                           "api_key", "access_key", "private", "id_rsa",
-                           "id_ed25519"}) {
-    if (lower.find(term) != std::string::npos) return true;
-  }
-  for (const auto* suffix : {".env", ".pem", ".key", ".p12", ".pfx", ".crt"}) {
-    if (lower.size() >= std::strlen(suffix) &&
-        lower.compare(lower.size() - std::strlen(suffix), std::strlen(suffix),
-                      suffix) == 0) {
-      return true;
-    }
-  }
-  return lower.rfind(".env.", 0) == 0 || lower == ".netrc" ||
-         lower == ".npmrc" || lower == ".pypirc" ||
-         lower == ".dockerconfigjson";
-}
 
 std::string workspace_snapshot(const std::filesystem::path& root) {
   static const std::set<std::string> skipped_directories = {

@@ -17,19 +17,22 @@ find_package(OpenSSL REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(JSONC REQUIRED IMPORTED_TARGET json-c)
 
-add_executable(mtrxai
+add_library(mtrxai_core STATIC
   src/config.cpp
   src/files.cpp
-  src/main.cpp
   src/pipeline.cpp
   src/provider.cpp
   src/setup_wizard.cpp
   src/tui.cpp
   src/update.cpp
 )
-target_include_directories(mtrxai PRIVATE include ${CURSES_INCLUDE_DIRS})
-target_link_libraries(mtrxai PRIVATE CURL::libcurl OpenSSL::Crypto ${CURSES_LIBRARIES} PkgConfig::JSONC)
-target_compile_definitions(mtrxai PRIVATE MTRXAI_VERSION="${PROJECT_VERSION}")
+target_include_directories(mtrxai_core PUBLIC include ${CURSES_INCLUDE_DIRS})
+target_link_libraries(mtrxai_core PUBLIC CURL::libcurl OpenSSL::Crypto ${CURSES_LIBRARIES} PkgConfig::JSONC)
+target_compile_definitions(mtrxai_core PUBLIC MTRXAI_VERSION="${PROJECT_VERSION}")
+target_compile_options(mtrxai_core PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(mtrxai src/main.cpp)
+target_link_libraries(mtrxai PRIVATE mtrxai_core)
 target_compile_options(mtrxai PRIVATE -Wall -Wextra -Wpedantic)
 
 install(TARGETS mtrxai RUNTIME DESTINATION bin)
@@ -55,6 +58,20 @@ set(CPACK_RPM_PACKAGE_GROUP "Development/Tools")
 include(CPack)
 
 if(BUILD_TESTING)
+  set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
+  include(FetchContent)
+  FetchContent_Declare(
+    doctest
+    GIT_REPOSITORY https://github.com/doctest/doctest.git
+    GIT_TAG v2.4.12
+  )
+  FetchContent_MakeAvailable(doctest)
+
+  add_executable(unit_tests tests/unit_tests.cpp)
+  target_link_libraries(unit_tests PRIVATE mtrxai_core doctest::doctest)
+  target_compile_options(unit_tests PRIVATE -Wall -Wextra -Wpedantic)
+  add_test(NAME unit_tests COMMAND unit_tests)
+
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)
     add_test(NAME pipeline-e2e

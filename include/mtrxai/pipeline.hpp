@@ -8,6 +8,10 @@
 
 namespace mtrxai {
 
+// Returns true if filename matches sensitive file names or patterns that must
+// not be read, listed, or written by the automated coder.
+bool sensitive_filename(const std::string& name);
+
 class Pipeline {
  public:
   using Status = std::function<void(const std::string&)>;

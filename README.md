@@ -122,8 +122,11 @@ can also be used as an OpenAI-compatible endpoint. For direct GGUF use, install
 The Coder iteratively lists and reads project files, requests individual file
 writes, and runs relevant checks. Each proposed write and each shell command is
 shown in a paged review screen; nothing is written or executed until you
-explicitly approve it. Reads skip private/secret-like paths, exclude build and
-VCS directories, and return 4 KiB chunks (with offsets) from files up to 2 MiB.
+explicitly approve it. Reads and writes protect sensitive credentials and keys
+matching exact names (`.env`, `.netrc`, `.npmrc`, `.pypirc`, `credentials.json`)
+and patterns (`.env.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*`, `id_ed25519*`),
+exclude build and VCS directories, and return 4 KiB chunks (with offsets) from files up to 2 MiB.
+Common source files like `tokenizer.cpp` or `dev.env` remain accessible.
 Commands run from the
 project root with a minimal environment (API keys are not passed to commands);
 they are limited to 300 seconds and 16 KiB of output. File paths
