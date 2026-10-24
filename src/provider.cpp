@@ -1,4 +1,5 @@
 #include "mtrxai/provider.hpp"
+#include "mtrxai/signals.hpp"
 
 #include <curl/curl.h>
 #include <json-c/json.h>
@@ -300,6 +301,7 @@ class LlamaServer {
     status("Starting llama-server (one local model at a time)...");
     pid_ = fork();
     if (pid_ < 0) throw std::runtime_error("Could not start llama-server");
+    if (pid_ > 0) mtrxai::signals::set_active_child(pid_);
     if (pid_ == 0) {
       if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) _exit(126);
       if (getppid() == 1) _exit(1);
@@ -364,6 +366,7 @@ class LlamaServer {
  private:
   void stop() {
     if (pid_ <= 0) return;
+    mtrxai::signals::set_active_child(0);
     kill(pid_, SIGTERM);
     for (int attempt = 0; attempt < 40; ++attempt) {
       if (waitpid(pid_, nullptr, WNOHANG) == pid_) {
@@ -407,6 +410,7 @@ struct InferenceSession::Impl {
       if (base_url.empty()) {
         throw std::runtime_error("An Ollama URL is required for " + slot.name);
       }
+      mtrxai::signals::set_active_ollama(slot.base_url, slot.model);
       status("Ollama will keep this role loaded only during its stage.");
       return;
     }
@@ -455,6 +459,7 @@ InferenceSession::InferenceSession(const ModelSlot& slot, const Status& status)
     : impl_(std::make_unique<Impl>(slot, status)) {}
 
 InferenceSession::~InferenceSession() noexcept {
+  mtrxai::signals::clear_active_ollama();
   if (impl_ && impl_->llama_server) impl_->llama_server.reset();
 }
 
@@ -473,6 +478,7 @@ std::string InferenceSession::generate(const Messages& messages) {
 }
 
 void InferenceSession::release() {
+  mtrxai::signals::clear_active_ollama();
   if (!impl_ || impl_->released) return;
   if (impl_->slot.provider == "ollama") {
     impl_->status("Unloading Ollama model before the next role...");

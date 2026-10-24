@@ -1,6 +1,7 @@
 #include "mtrxai/tui.hpp"
 
 #include "mtrxai/pipeline.hpp"
+#include "mtrxai/signals.hpp"
 
 #include <ncurses.h>
 
@@ -25,7 +26,10 @@ constexpr int kSidebarWidth = 25;
 const Config* screen_config = nullptr;
 
 struct ScreenGuard {
-  ~ScreenGuard() { endwin(); }
+  ~ScreenGuard() {
+    mtrxai::signals::set_curses_active(false);
+    endwin();
+  }
 };
 
 std::string safe_terminal_text(const std::string& text) {
@@ -414,6 +418,7 @@ void handle_command(Config& config, const std::filesystem::path& config_file,
 
 int run_tui(Config& config, const std::filesystem::path& config_file) {
   if (initscr() == nullptr) throw std::runtime_error("Could not initialize terminal UI");
+  mtrxai::signals::set_curses_active(true);
   ScreenGuard screen_guard;
   cbreak();
   noecho();

@@ -3,6 +3,7 @@
 
 #include "mtrxai/pipeline.hpp"
 #include "mtrxai/provider.hpp"
+#include "mtrxai/signals.hpp"
 
 TEST_CASE("llama_log_path uses state home and role") {
   const std::string path = mtrxai::llama_log_path("coder").string();
@@ -114,5 +115,14 @@ TEST_CASE("extract_thinking separates reasoning from answer") {
 TEST_CASE("ModelSlot defaults max_tokens to 4096") {
   mtrxai::ModelSlot slot;
   CHECK(slot.max_tokens == 4096);
+}
+
+TEST_CASE("signals state tracking methods operate safely") {
+  mtrxai::signals::set_curses_active(true);
+  mtrxai::signals::set_curses_active(false);
+  mtrxai::signals::set_active_child(12345);
+  mtrxai::signals::set_active_child(0);
+  mtrxai::signals::set_active_ollama("http://localhost:11434", "test-model");
+  mtrxai::signals::clear_active_ollama();
 }
 

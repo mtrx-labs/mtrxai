@@ -2,6 +2,7 @@
 
 #include "mtrxai/files.hpp"
 #include "mtrxai/provider.hpp"
+#include "mtrxai/signals.hpp"
 
 #include <json-c/json.h>
 
@@ -467,6 +468,9 @@ std::string run_command(const std::filesystem::path& root,
     close(output_pipe[1]);
     throw std::runtime_error("Could not start the approved command.");
   }
+  if (child > 0) {
+    mtrxai::signals::set_active_child(child);
+  }
   if (child == 0) {
     setpgid(0, 0);
     if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) _exit(126);
@@ -528,6 +532,7 @@ std::string run_command(const std::filesystem::path& root,
     }
     if (truncated && !exited) kill(-child, SIGTERM);
   }
+  mtrxai::signals::set_active_child(0);
   close(output_pipe[0]);
   if (timed_out) output += "\n[command timed out]\n";
   if (truncated) output += "\n[output truncated at 16 KiB]\n";

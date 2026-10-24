@@ -1,4 +1,5 @@
 #include "mtrxai/config.hpp"
+#include "mtrxai/signals.hpp"
 #include "mtrxai/tui.hpp"
 #include "mtrxai/update.hpp"
 
@@ -26,6 +27,7 @@ void usage(const char* program) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  mtrxai::signals::install();
   try {
     bool skip_update_check = false;
     if (argc > 1) {

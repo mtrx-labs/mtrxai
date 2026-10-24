@@ -141,9 +141,86 @@ def check_setup_wizard(binary, root):
         os.close(master)
 
 
+def check_signal_handling(binary, root):
+    user_home = root / "signal-home"
+    user_home.mkdir()
+    config_home = root / "signal-config"
+    config_path = config_home / "mtrxai" / "config.json"
+    config_path.parent.mkdir(parents=True)
+
+    ollama_unloaded = threading.Event()
+
+    class SignalHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            if self.path == "/api/generate":
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if body.get("keep_alive") == 0:
+                    ollama_unloaded.set()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b"{}")
+                return
+            # Hang briefly on /api/chat so SIGINT is received while Ollama is active
+            time.sleep(2)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"message":{"content":"ok"}}')
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SignalHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    config = {
+        "chief": {"provider": "ollama", "model": "chief-sig-model", "base_url": f"http://127.0.0.1:{server.server_port}"},
+        "prompter": {"provider": "ollama", "model": "prompter-sig-model", "base_url": f"http://127.0.0.1:{server.server_port}"},
+        "coder": {"provider": "ollama", "model": "coder-sig-model", "base_url": f"http://127.0.0.1:{server.server_port}"},
+    }
+    config_path.write_text(json.dumps(config))
+
+    env = os.environ.copy()
+    env.update({"HOME": str(user_home), "XDG_CONFIG_HOME": str(config_home), "TERM": "xterm"})
+    master, slave = pty.openpty()
+    process = subprocess.Popen(
+        [binary, "--no-update-check"], cwd=root, env=env,
+        stdin=slave, stdout=slave, stderr=slave
+    )
+    os.close(slave)
+    output = bytearray()
+    try:
+        deadline = time.time() + 8
+        while b"Describe what you want to build" not in output and time.time() < deadline:
+            r, _, _ = select.select([master], [], [], 0.1)
+            if r:
+                try:
+                    output.extend(os.read(master, 1024))
+                except OSError:
+                    break
+        assert b"Describe what you want to build" in output
+
+        os.write(master, b"Test task\n")
+        # Give it a moment to initiate the Ollama call
+        time.sleep(0.3)
+
+        os.kill(process.pid, 2)  # SIGINT
+        exit_code = process.wait(timeout=5)
+        assert exit_code != 0, f"Expected non-zero exit code on SIGINT, got {exit_code}"
+        assert ollama_unloaded.wait(timeout=4), "Ollama keep_alive: 0 unload request was not received on SIGINT"
+    finally:
+        server.shutdown()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        os.close(master)
+
+
 def run(binary):
     temp = Path(tempfile.mkdtemp(prefix="mtrxai-e2e-"))
     check_setup_wizard(binary, temp)
+    check_signal_handling(binary, temp)
     workspace = temp / "workspace"
     outside = temp / "outside"
     config_home = temp / "config"
