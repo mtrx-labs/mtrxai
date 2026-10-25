@@ -15,12 +15,15 @@ struct ModelSlot {
   std::string gguf_path;
   int context_size = 2048;
   int max_tokens = 4096;
+  int gguf_load_timeout_seconds = 150;
 };
 
 struct Config {
   ModelSlot chief;
   ModelSlot prompter;
   ModelSlot coder;
+  int max_turns = 40;
+  int gguf_load_timeout_seconds = 150;
 };
 
 std::filesystem::path config_path();

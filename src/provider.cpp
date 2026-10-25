@@ -4,6 +4,7 @@
 #include <curl/curl.h>
 #include <json-c/json.h>
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <csignal>
 #include <cstdlib>
@@ -329,7 +330,9 @@ class LlamaServer {
       _exit(127);
     }
     const std::string health_url = "http://127.0.0.1:" + std::to_string(port_) + "/health";
-    for (int attempt = 0; attempt < 600; ++attempt) {
+    const int timeout = std::clamp(slot.gguf_load_timeout_seconds, 1, 3600);
+    const int attempts = timeout * 4;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
       int child_status = 0;
       if (waitpid(pid_, &child_status, WNOHANG) == pid_) {
         pid_ = -1;
@@ -352,7 +355,8 @@ class LlamaServer {
       std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
     stop();
-    throw std::runtime_error("llama-server did not become ready within 150 seconds");
+    throw std::runtime_error("llama-server did not become ready within " +
+                             std::to_string(timeout) + " seconds");
   }
 
   ~LlamaServer() { stop(); }

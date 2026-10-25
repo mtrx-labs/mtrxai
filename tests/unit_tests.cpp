@@ -126,3 +126,29 @@ TEST_CASE("signals state tracking methods operate safely") {
   mtrxai::signals::clear_active_ollama();
 }
 
+TEST_CASE("Config defaults and serialization of turns, timeout, and context") {
+  mtrxai::Config config;
+  CHECK(config.max_turns == 40);
+  CHECK(config.gguf_load_timeout_seconds == 150);
+
+  config.max_turns = 25;
+  config.gguf_load_timeout_seconds = 60;
+  config.coder.context_size = 4096;
+  config.chief.provider = "ollama";
+  config.chief.model = "chief-m";
+  config.prompter.provider = "ollama";
+  config.prompter.model = "prompter-m";
+  config.coder.provider = "ollama";
+  config.coder.model = "coder-m";
+
+  const auto temp_config_path =
+      std::filesystem::temp_directory_path() / "mtrxai_test_config.json";
+  mtrxai::save_config(config, temp_config_path);
+
+  const auto loaded = mtrxai::load_config(temp_config_path);
+  CHECK(loaded.max_turns == 25);
+  CHECK(loaded.gguf_load_timeout_seconds == 60);
+  CHECK(loaded.coder.context_size == 4096);
+  std::filesystem::remove(temp_config_path);
+}
+

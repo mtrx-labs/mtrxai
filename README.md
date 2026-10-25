@@ -107,7 +107,17 @@ Edit `~/.config/mtrxai/config.json` or use TUI commands:
 /endpoint coder https://api.example.com/v1
 /keyenv coder MY_API_KEY
 /apikey coder
+/context coder 4096
+/maxturns 60
+/gguftimeout 300
 ```
+
+`/context` sets a role's context window in tokens (512-32768). `/maxturns` sets
+the Coder turn limit (1-500). `/gguftimeout` sets how long llama-server may take
+to load a GGUF model before mtrxAI gives up (1-3600 seconds). The same values
+are stored in `config.json` as top-level `max_turns` and
+`gguf_load_timeout_seconds`, per-slot `context_size`, and per-slot
+`gguf_load_timeout_seconds`.
 
 Set a role's `provider` to `openai` for an OpenAI-compatible `/chat/completions`
 endpoint or `anthropic` for Anthropic's native Messages API. Both support

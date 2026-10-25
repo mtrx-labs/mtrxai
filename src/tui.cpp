@@ -278,19 +278,24 @@ void show_roles(const Config& config) {
                                                      : slot.gguf_path)
                            : slot.model;
     text << slot.name << ": " << slot.provider << " / "
-         << model << '\n';
+         << model << " (ctx: " << slot.context_size << ", max_tokens: " << slot.max_tokens << ")\n";
   }
+  text << "Pipeline: max turns: " << config.max_turns
+       << ", GGUF load timeout: " << config.gguf_load_timeout_seconds << "s\n";
   show(text.str());
 }
 
 void command_help() {
   show("Commands:\n"
-       "  /roles                         show the active model assignments\n"
+       "  /roles                         show active model assignments & limits\n"
        "  /model ROLE PROVIDER MODEL      hot-swap a role (ollama, openai, anthropic, gguf)\n"
        "  /endpoint ROLE URL              set an API base URL\n"
        "  /keyenv ROLE ENV_NAME           select an API-key environment variable\n"
        "  /apikey ROLE                    enter or clear a saved API key (hidden input)\n"
        "  /gguf ROLE PATH                 set a local GGUF file path\n"
+       "  /context ROLE SIZE              set context window size (512-32768)\n"
+       "  /maxturns NUMBER                set max Coder turns (1-500)\n"
+       "  /gguftimeout SECONDS            set GGUF server load timeout (1-3600)\n"
        "Use Up/Down or PgUp/PgDn to review every proposed file or shell command.\n"
        "  /help                           show this help\n"
        "  /quit                           exit");
@@ -343,8 +348,73 @@ void handle_command(Config& config, const std::filesystem::path& config_file,
     command_help();
     return;
   }
+  if (name == "/maxturns") {
+    std::string value;
+    command >> value;
+    int turns = 0;
+    try {
+      turns = std::stoi(value);
+    } catch (...) {
+      show("Usage: /maxturns NUMBER (1-500)");
+      return;
+    }
+    if (turns < 1 || turns > 500) {
+      show("max_turns must be between 1 and 500.");
+      return;
+    }
+    config.max_turns = turns;
+    save_config(config, config_file);
+    show("Saved max turns: " + std::to_string(turns) + ".");
+    return;
+  }
+  if (name == "/gguftimeout") {
+    std::string value;
+    command >> value;
+    int timeout = 0;
+    try {
+      timeout = std::stoi(value);
+    } catch (...) {
+      show("Usage: /gguftimeout SECONDS (1-3600)");
+      return;
+    }
+    if (timeout < 1 || timeout > 3600) {
+      show("gguf_load_timeout_seconds must be between 1 and 3600.");
+      return;
+    }
+    config.gguf_load_timeout_seconds = timeout;
+    config.chief.gguf_load_timeout_seconds = timeout;
+    config.prompter.gguf_load_timeout_seconds = timeout;
+    config.coder.gguf_load_timeout_seconds = timeout;
+    save_config(config, config_file);
+    show("Saved GGUF load timeout: " + std::to_string(timeout) + " seconds.");
+    return;
+  }
   std::string role;
   command >> role;
+  if (name == "/context") {
+    std::string value;
+    command >> value;
+    if (role.empty() || value.empty()) {
+      show("Usage: /context ROLE SIZE (512-32768)");
+      return;
+    }
+    int size = 0;
+    try {
+      size = std::stoi(value);
+    } catch (...) {
+      show("Invalid context size.");
+      return;
+    }
+    if (size < 512 || size > 32768) {
+      show("context_size must be between 512 and 32768.");
+      return;
+    }
+    auto& slot = find_slot(config, role);
+    slot.context_size = size;
+    save_config(config, config_file);
+    show("Saved context size " + std::to_string(size) + " for " + role + ".");
+    return;
+  }
   if (name == "/apikey") {
     if (role.empty()) {
       show("Usage: /apikey ROLE");

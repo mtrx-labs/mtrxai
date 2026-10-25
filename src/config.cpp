@@ -36,6 +36,8 @@ Json slot_json(const ModelSlot& slot) {
                          json_object_new_int(slot.context_size));
   json_object_object_add(result.get(), "max_tokens",
                          json_object_new_int(slot.max_tokens));
+  json_object_object_add(result.get(), "gguf_load_timeout_seconds",
+                         json_object_new_int(slot.gguf_load_timeout_seconds));
   return result;
 }
 
@@ -72,6 +74,11 @@ ModelSlot parse_slot(const char* name, json_object* root) {
   if (json_object_object_get_ex(object, "max_tokens", &max_tokens) &&
       json_object_is_type(max_tokens, json_type_int)) {
     slot.max_tokens = json_object_get_int(max_tokens);
+  }
+  json_object* gguf_timeout = nullptr;
+  if (json_object_object_get_ex(object, "gguf_load_timeout_seconds", &gguf_timeout) &&
+      json_object_is_type(gguf_timeout, json_type_int)) {
+    slot.gguf_load_timeout_seconds = json_object_get_int(gguf_timeout);
   }
 
   if (slot.provider != "ollama" && slot.provider != "openai" &&
@@ -164,6 +171,21 @@ Config load_config(const std::filesystem::path& path) {
   }
   Config config{parse_slot("chief", root.get()), parse_slot("prompter", root.get()),
                 parse_slot("coder", root.get())};
+  json_object* max_turns = nullptr;
+  if (json_object_object_get_ex(root.get(), "max_turns", &max_turns) &&
+      json_object_is_type(max_turns, json_type_int)) {
+    config.max_turns = json_object_get_int(max_turns);
+  }
+  json_object* gguf_timeout = nullptr;
+  if (json_object_object_get_ex(root.get(), "gguf_load_timeout_seconds", &gguf_timeout) &&
+      json_object_is_type(gguf_timeout, json_type_int)) {
+    config.gguf_load_timeout_seconds = json_object_get_int(gguf_timeout);
+  }
+  for (auto* slot : {&config.chief, &config.prompter, &config.coder}) {
+    if (slot->gguf_load_timeout_seconds == 150 && config.gguf_load_timeout_seconds != 150) {
+      slot->gguf_load_timeout_seconds = config.gguf_load_timeout_seconds;
+    }
+  }
   load_credentials(config, path);
   return config;
 }
@@ -174,6 +196,10 @@ void save_config(const Config& config, const std::filesystem::path& path) {
   json_object_object_add(root.get(), "prompter",
                          slot_json(config.prompter).release());
   json_object_object_add(root.get(), "coder", slot_json(config.coder).release());
+  json_object_object_add(root.get(), "max_turns",
+                         json_object_new_int(config.max_turns));
+  json_object_object_add(root.get(), "gguf_load_timeout_seconds",
+                         json_object_new_int(config.gguf_load_timeout_seconds));
 
   std::error_code error;
   std::filesystem::create_directories(path.parent_path(), error);

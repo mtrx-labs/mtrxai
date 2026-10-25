@@ -679,12 +679,13 @@ void Pipeline::run(const std::string& request, const Status& status,
   InferenceSession coder_model(config_.coder, status);
   std::string coder_log = "# Coder session\n\n";
   write_atomic(session / "coder.md", coder_log);
-  for (int turn = 1; turn <= 40; ++turn) {
+  const int max_turns = std::clamp(config_.max_turns, 1, 500);
+  for (int turn = 1; turn <= max_turns; ++turn) {
     while (coder_messages.size() > 8) {
       coder_messages.erase(coder_messages.begin() + 2,
                            coder_messages.begin() + 4);
     }
-    status("Coder turn " + std::to_string(turn) + " of 40");
+    status("Coder turn " + std::to_string(turn) + " of " + std::to_string(max_turns));
     const std::string response_raw = coder_model.generate(coder_messages);
     const auto response = extract_thinking(response_raw);
     coder_messages.emplace_back("assistant", response.content);
@@ -785,7 +786,8 @@ void Pipeline::run(const std::string& request, const Status& status,
                     "\nContinue the task. Use another action or finish.");
   }
   save_manifest(session, "turn-limit");
-  throw std::runtime_error("Coder reached the 40-turn limit. Its work log is saved at " +
+  throw std::runtime_error("Coder reached the " + std::to_string(max_turns) +
+                           "-turn limit. Its work log is saved at " +
                            (session / "coder.md").string());
 }
 
