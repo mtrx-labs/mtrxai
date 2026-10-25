@@ -45,12 +45,39 @@ needs network access.
 - SIGINT/SIGTERM handlers only set the process token; the pipeline, llama-server startup, command runner, and Coder loop observe it. The TUI stops its worker, unloads Ollama, restores the terminal, and returns `128 + signal` (130 for SIGINT).
 - `Config::max_turns` (default 40) and GGUF load timeout (default 150 s) load from old and new configs.
 
-**Next.** Phase 2: raw response body bytes, provider-specific replay, and live
-events driven by that same incremental replay parser.
-
 **Known risks / not run.** Real Ollama/GGUF and real Anthropic streaming were not run;
 their protocols are covered by unit tests and mock servers.
 
 **Merge status.** Phase 0 and Phase 1 implementation work is present in local
 commits, but neither is contained in `origin/main` as of the verified remote
 head `5c1b08b`; they are not merged upstream yet.
+
+## Phase 2 — raw streams and replay
+
+The Phase 2 implementation is committed as `56660bf` on
+`phase2-raw-stream-contract`. Each call stores the response body bytes exactly
+as received in `call-<N>.raw` and stores the provider kind in
+`call-<N>.meta.json`. `ReplayParser` is the incremental parser used both while
+streaming and by `replay(raw_bytes, provider_kind)` for derived artifacts.
+Normalized chunks are not stored in the raw file. No event-driven
+`Pipeline::resume` overload was added; that belongs to Phase 3.
+
+**Verified.** Release configure/build succeeded. As uid 1000,
+`ctest --test-dir build --output-on-failure` passed 2/2, including the e2e
+checks for exact raw bytes from all three provider protocols and cancellation
+with no derived output. Real model servers were not tested.
+
+**Push status.** The local branch contains the Phase 0 documentation commit
+`ebfa98e`, prior Phase 1 commits, and the Phase 2 commit. Phase 0 and Phase 1
+are complete locally but not merged to `origin/main`. The push could not be
+completed because this environment has no GitHub HTTPS credentials or
+authorized SSH key. No PR was opened.
+
+**Existing later-phase work in the base history.** Session listing/resume and
+the FTXUI rewrite predate these changes in this checkout. FTXUI remains pinned
+to v7.0.3 in that pre-existing commit; this Phase 2 commit does not modify
+FTXUI. Phase 4 still requires v6.1.9.
+
+**Next.** The Phase 3 session/resume work is already present in the base
+history; review it as a separate phase after Phase 0/1 are merged. Then handle
+the FTXUI version and remaining Phase 4 requirements.
