@@ -39,6 +39,7 @@ add_library(mtrxai_core STATIC
   src/files.cpp
   src/pipeline.cpp
   src/provider.cpp
+  src/provider_stream.cpp
   src/safety.cpp
   src/session.cpp
   src/setup_wizard.cpp

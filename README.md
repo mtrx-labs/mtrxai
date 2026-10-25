@@ -163,11 +163,13 @@ are checked against traversal and symlink escapes. Replaced files are backed
 up in the private session folder. Generated commands are not run automatically.
 
 mtrxAI saves the Chief and Prompter handoffs and each Coder turn before moving
-on. Every stage additionally records its streamed tokens verbatim in
-`<session>/<stage>/raw.jsonl` (owner-only, flushed as chunks arrive, fsynced
-about once a second); the derived stage files such as `chief.md` are written
-afterwards from that recording, so a killed run still leaves enough state to
-rebuild the stage. The Coder also writes a transcript at
+on. Every model call records the response body bytes exactly as received in
+`<session>/<stage>/call-<N>.raw` (owner-only, written as bytes arrive, fsynced
+about once a second). A sibling `call-<N>.meta.json` records the provider kind.
+The same incremental parser handles live bytes and replays the raw file to
+derive `chief.md`, `prompt.md`, and Coder text, so a killed run leaves the
+original response available without treating normalized chunks as raw data.
+The Coder also writes a transcript at
 `<session>/coder/messages.jsonl`: one owner-only, fsynced JSON line per message
 in the Coder context, including the exact tool-result text; assistant reasoning
 is stored separately. The manifest tracks progress, but the transcript is what

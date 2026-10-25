@@ -4,6 +4,7 @@
 #include "mtrxai/coder_transcript.hpp"
 #include "mtrxai/files.hpp"
 #include "mtrxai/provider.hpp"
+#include "mtrxai/provider_stream.hpp"
 #include "mtrxai/safety.hpp"
 #include "mtrxai/session.hpp"
 #include "mtrxai/signals.hpp"
@@ -494,9 +495,8 @@ std::filesystem::path unused_archive_path(const std::filesystem::path& path) {
                            path.string());
 }
 
-// A resumed run may have to ask a model again. Keeping the previous raw log
-// (instead of appending to it) is essential: read_raw_text would otherwise
-// concatenate the abandoned partial answer with the new one.
+// A retry gets its own response file. Keep abandoned bytes for inspection and
+// ensure the next call starts with an empty raw body.
 void move_aside(const std::filesystem::path& path) {
   std::error_code error;
   if (!std::filesystem::exists(path, error) || error) return;
@@ -542,6 +542,39 @@ std::filesystem::path archive_rejected_reply(
   return path;
 }
 
+std::filesystem::path call_raw_path(const std::filesystem::path& session,
+                                    const std::string& stage, int call) {
+  return session / stage / ("call-" + std::to_string(call) + ".raw");
+}
+
+std::filesystem::path call_meta_path(const std::filesystem::path& session,
+                                     const std::string& stage, int call) {
+  return session / stage / ("call-" + std::to_string(call) + ".meta.json");
+}
+
+void write_call_metadata(const std::filesystem::path& path,
+                         const std::string& provider) {
+  Json metadata(json_object_new_object());
+  json_object_object_add(metadata.get(), "provider_kind",
+                         json_object_new_string(provider.c_str()));
+  write_atomic(path,
+               json_object_to_json_string_ext(metadata.get(),
+                                              JSON_C_TO_STRING_PLAIN));
+}
+
+ProviderKind read_provider_kind(const std::filesystem::path& path,
+                                ProviderKind fallback) {
+  const std::string bytes = read_text_file(path);
+  Json metadata(json_tokener_parse(bytes.c_str()));
+  if (!metadata) return fallback;
+  json_object* value = nullptr;
+  if (!json_object_object_get_ex(metadata.get(), "provider_kind", &value) ||
+      !json_object_is_type(value, json_type_string)) {
+    return fallback;
+  }
+  return provider_kind(json_object_get_string(value));
+}
+
 // Stages only move forward. A manifest from an older version may be missing,
 // so an unknown stage ranks below "request" and the run starts over.
 int stage_rank(const std::string& stage) {
@@ -576,6 +609,68 @@ class ActiveSessionGuard {
 
 }  // namespace
 
+struct Pipeline::RunHooks {
+  PipelineEvents* events = nullptr;
+  CancelToken* cancel = nullptr;
+  std::atomic<bool>* internal_cancel = nullptr;
+  Status status;
+  Confirm confirm;
+  InferenceSession::TokenSink tokens;
+  Stage current_stage = Stage::Chief;
+  StageStatus current_status = StageStatus::Queued;
+
+  bool cancelled() const {
+    return (internal_cancel != nullptr &&
+            internal_cancel->load(std::memory_order_relaxed)) ||
+           (cancel != nullptr && cancel->cancelled()) ||
+           process_cancel_token().cancelled();
+  }
+
+  void throw_if_cancelled(const std::string& point) const {
+    if (cancelled()) throw Cancelled("Cancelled at " + point + ".");
+  }
+
+  void stage(Stage stage_value, StageStatus status_value,
+             const std::string& note) {
+    current_stage = stage_value;
+    current_status = status_value;
+    if (events != nullptr && events->on_stage) {
+      events->on_stage(stage_value, status_value, note);
+    }
+  }
+
+  void log(const std::string& text) {
+    if (status) status(text);
+    if (events != nullptr && events->log) events->log(text);
+  }
+
+  Status status_callback() {
+    return [this](const std::string& text) { log(text); };
+  }
+
+  void chunk(Stage stage_value, const StreamChunk& chunk_value) {
+    if (events != nullptr && events->on_chunk) {
+      events->on_chunk(stage_value, chunk_value);
+    }
+    if (tokens && chunk_value.kind == StreamChunk::Kind::Content) {
+      tokens(chunk_value.text);
+    }
+  }
+
+  bool ask(const std::string& review) {
+    if (events != nullptr && events->confirm) return events->confirm(review);
+    if (confirm) return confirm(review);
+    // No approval callback means no approval. Never auto-apply a change.
+    return false;
+  }
+
+  void fail(const std::string& note) {
+    if (events != nullptr && events->on_stage) {
+      events->on_stage(current_stage, StageStatus::Failed, note);
+    }
+  }
+};
+
 Pipeline::Pipeline(Config& config) : config_(config) {}
 
 void Pipeline::request_cancel() {
@@ -584,6 +679,26 @@ void Pipeline::request_cancel() {
   // its remaining seconds.
   if (auto* session = active_session_.load(std::memory_order_relaxed)) {
     session->request_cancel();
+  }
+}
+
+RunResult Pipeline::run(const std::string& request, PipelineEvents& events,
+                        CancelToken& cancel) {
+  RunHooks hooks;
+  hooks.events = &events;
+  hooks.cancel = &cancel;
+  hooks.internal_cancel = &cancelled_;
+  try {
+    run_impl_events({}, request, hooks);
+    return RunResult::Finished;
+  } catch (const Cancelled& error) {
+    hooks.fail(error.what());
+    hooks.log(error.what());
+    return RunResult::Cancelled;
+  } catch (const std::exception& error) {
+    hooks.fail(error.what());
+    hooks.log(error.what());
+    return RunResult::Failed;
   }
 }
 
@@ -603,19 +718,25 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
                         std::string request, const Status& status,
                         const Confirm& confirm,
                         const InferenceSession::TokenSink& tokens) {
+  RunHooks hooks;
+  hooks.internal_cancel = &cancelled_;
+  hooks.status = status;
+  hooks.confirm = confirm;
+  hooks.tokens = tokens;
+  run_impl_events(resume_session, std::move(request), hooks);
+}
+
+void Pipeline::run_impl_events(const std::filesystem::path& resume_session,
+                               std::string request, RunHooks& hooks) {
   // Each run starts clean; without this, one Esc press would cancel every
   // later run for the rest of the session.
   cancelled_.store(false, std::memory_order_relaxed);
-  auto throw_if_cancelled = [this](const std::string& point) {
-    if (cancelled_.load(std::memory_order_relaxed) ||
-        process_cancel_token().cancelled()) {
-      throw Cancelled("Cancelled at " + point + ".");
-    }
+  auto throw_if_cancelled = [&hooks](const std::string& point) {
+    hooks.throw_if_cancelled(point);
   };
-  auto wrap_tokens = [&tokens](RawRecorder& recorder, int turn) {
-    return [&, turn](const std::string& chunk) {
-      recorder.append(chunk, turn);
-      if (tokens) tokens(chunk);
+  auto wrap_chunks = [&hooks](Stage stage) {
+    return [&hooks, stage](const StreamChunk& chunk) {
+      hooks.chunk(stage, chunk);
     };
   };
   const auto root = std::filesystem::canonical(std::filesystem::current_path());
@@ -685,41 +806,78 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
       save_manifest(session, "request");
       completed_stage = "request";
     }
-    status("Resuming session " + session.filename().string() +
+    hooks.log("Resuming session " + session.filename().string() +
            ", continuing after saved stage " + completed_stage + ".");
   }
   throw_if_cancelled("the start");
 
+  hooks.stage(Stage::Chief, StageStatus::Queued, "Chief of Staff");
+  hooks.stage(Stage::Prompter, StageStatus::Queued, "Prompter");
+  hooks.stage(Stage::Coder, StageStatus::Queued, "Coder");
+
+  // Artifacts are always derived from the recorded stream, never from the
+  // provider return value alone. The same helper rebuilds a missing artifact
+  // on resume and applies a freshly generated stream.
+  auto replay_artifact = [&](const std::string& stage, int call,
+                             const std::string& provider,
+                             const std::filesystem::path& content_path,
+                             const std::filesystem::path& reasoning_path) {
+    const auto raw_path = call_raw_path(session, stage, call);
+    std::error_code exists_error;
+    if (!std::filesystem::exists(raw_path, exists_error) || exists_error) {
+      return read_text_file(content_path);
+    }
+    const auto kind = read_provider_kind(
+        call_meta_path(session, stage, call), provider_kind(provider));
+    const ReplayResult parsed = replay(read_raw_bytes(raw_path), kind);
+    write_atomic(content_path, parsed.content);
+    write_atomic(reasoning_path, parsed.reasoning);
+    return parsed.content;
+  };
+
   bool chief_saved = stage_rank(completed_stage) >= stage_rank("chief");
   std::string chief_content;
   if (chief_saved) {
-    chief_content = read_text_file(session / "chief.md");
+    chief_content = replay_artifact("chief", 1,
+                                    config_.chief.provider, session / "chief.md",
+                                    session / "chief.reasoning.md");
     chief_saved = !chief_content.empty();
   }
   if (chief_saved) {
-    status("Chief of Staff: saved brief, skipping the model call.");
+    hooks.stage(Stage::Chief, StageStatus::Saved,
+                "Using the saved Chief of Staff brief.");
+    hooks.log("Chief of Staff: saved brief, skipping the model call.");
   } else {
-    status("Chief of Staff: " + config_.chief.model);
+    hooks.stage(Stage::Chief, StageStatus::Loading,
+                "Chief of Staff: " + config_.chief.model);
+    hooks.log("Chief of Staff: " + config_.chief.model);
     // The raw stream is on disk before the stage is considered done, so a
     // resume can rebuild it; chief.md is derived from that recording.
-    const auto chief_raw_path = session / "chief" / "raw.jsonl";
-    if (resuming) move_aside(chief_raw_path);
+    const auto chief_raw_path = call_raw_path(session, "chief", 1);
+    const auto chief_meta_path = call_meta_path(session, "chief", 1);
+    move_aside(chief_raw_path);
+    move_aside(chief_meta_path);
     {
-      RawRecorder recorder(chief_raw_path);
-      InferenceSession model(config_.chief, status, &process_cancel_token());
+      RawByteRecorder recorder(chief_raw_path);
+      write_call_metadata(chief_meta_path, config_.chief.provider);
+      InferenceSession model(config_.chief, hooks.status_callback(), hooks.cancel);
       ActiveSessionGuard active(active_session_, model);
+      hooks.stage(Stage::Chief, StageStatus::Running, config_.chief.model);
       model.generate({{"system", chief_instructions()}, {"user", request}},
-                     wrap_tokens(recorder, 0));
+                     [&recorder](const std::string& bytes) {
+                       recorder.append(bytes);
+                     },
+                     wrap_chunks(Stage::Chief));
       model.release();
     }
-    const std::string chief_raw = read_raw_text(chief_raw_path, 0);
-    const auto chief = extract_thinking(chief_raw);
-    if (!chief.thinking.empty()) {
-      write_atomic(session / "chief.reasoning.md", chief.thinking);
+    chief_content = replay_artifact("chief", 1,
+                                    config_.chief.provider, session / "chief.md",
+                                    session / "chief.reasoning.md");
+    if (chief_content.empty()) {
+      throw std::runtime_error("Chief of Staff stream produced no content.");
     }
-    write_atomic(session / "chief.md", chief.content);
     save_manifest(session, "chief");
-    chief_content = chief.content;
+    hooks.stage(Stage::Chief, StageStatus::Saved, "chief.md saved.");
   }
 
   // A saved prompt is only valid while the saved Chief brief is the one it was
@@ -728,42 +886,53 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
       chief_saved && stage_rank(completed_stage) >= stage_rank("prompter");
   std::string prompt_content;
   if (prompter_saved) {
-    prompt_content = read_text_file(session / "prompt.md");
+    prompt_content = replay_artifact("prompt", 1,
+                                     config_.prompter.provider, session / "prompt.md",
+                                     session / "prompt.reasoning.md");
     prompter_saved = !prompt_content.empty();
   }
   if (prompter_saved) {
-    status("Prompter: saved brief, skipping the model call.");
+    hooks.stage(Stage::Prompter, StageStatus::Saved,
+                "Using the saved implementation prompt.");
+    hooks.log("Prompter: saved brief, skipping the model call.");
   } else {
     const std::string prompt_input = "Original user request:\n" + request +
                                      "\n\nChief of Staff brief:\n" +
                                      chief_content;
-    status("Prompter: " + config_.prompter.model);
-    const auto prompt_raw_path = session / "prompt" / "raw.jsonl";
-    if (resuming) move_aside(prompt_raw_path);
+    hooks.stage(Stage::Prompter, StageStatus::Loading,
+                "Prompter: " + config_.prompter.model);
+    hooks.log("Prompter: " + config_.prompter.model);
+    const auto prompt_raw_path = call_raw_path(session, "prompt", 1);
+    const auto prompt_meta_path = call_meta_path(session, "prompt", 1);
+    move_aside(prompt_raw_path);
+    move_aside(prompt_meta_path);
     {
-      RawRecorder recorder(prompt_raw_path);
-      InferenceSession model(config_.prompter, status, &process_cancel_token());
+      RawByteRecorder recorder(prompt_raw_path);
+      write_call_metadata(prompt_meta_path, config_.prompter.provider);
+      InferenceSession model(config_.prompter, hooks.status_callback(), hooks.cancel);
       ActiveSessionGuard active(active_session_, model);
+      hooks.stage(Stage::Prompter, StageStatus::Running,
+                  config_.prompter.model);
       model.generate(
           {{"system", prompter_instructions()}, {"user", prompt_input}},
-          wrap_tokens(recorder, 0));
+          [&recorder](const std::string& bytes) { recorder.append(bytes); },
+          wrap_chunks(Stage::Prompter));
       model.release();
     }
-    const std::string prompt_raw = read_raw_text(prompt_raw_path, 0);
-    const auto prompt = extract_thinking(prompt_raw);
-    if (!prompt.thinking.empty()) {
-      write_atomic(session / "prompt.reasoning.md", prompt.thinking);
+    prompt_content = replay_artifact("prompt", 1,
+                                     config_.prompter.provider, session / "prompt.md",
+                                     session / "prompt.reasoning.md");
+    if (prompt_content.empty()) {
+      throw std::runtime_error("Prompter stream produced no content.");
     }
-    write_atomic(session / "prompt.md", prompt.content);
     save_manifest(session, "prompter");
-    prompt_content = prompt.content;
+    hooks.stage(Stage::Prompter, StageStatus::Saved, "prompt.md saved.");
   }
 
   // The Coder conversation is persisted message by message, including the
   // exact user wrapper around each tool result. A manifest stage alone cannot
   // tell whether an assistant reply was already produced, because the process
   // can die between the model reply and the tool result; the transcript can.
-  const auto coder_raw_path = session / "coder" / "raw.jsonl";
   const auto coder_transcript_path = session / "coder" / "messages.jsonl";
   std::vector<CoderMessage> saved_messages =
       CoderTranscript::load(coder_transcript_path);
@@ -780,7 +949,7 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
     reuse_transcript = false;
   }
   if (resuming && !reuse_transcript) {
-    status("Coder: no saved conversation to continue; starting the Coder "
+    hooks.log("Coder: no saved conversation to continue; starting the Coder "
            "from the saved plan.");
     move_aside(session / "coder");
     move_aside(session / "coder.md");
@@ -840,7 +1009,7 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
                       rejection + "\n\nIt was saved at coder/rejected/" +
                       archived.filename().string() +
                       " and replaced with a correction.\n\n";
-      status("Coder: saved reply for turn " + std::to_string(response_turn) +
+      hooks.log("Coder: saved reply for turn " + std::to_string(response_turn) +
              " was not a valid action; discarded it and will ask again.");
       response_content.clear();
       response_turn = 0;
@@ -864,6 +1033,13 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
   if (reuse_transcript) {
     for (const auto& message : saved_messages) {
       coder_messages.emplace_back(message.role, message.content);
+      if (message.role == "assistant" && message.turn > 0 &&
+          !message.thinking.empty()) {
+        write_atomic(session / ("coder-turn-" +
+                                std::to_string(message.turn) +
+                                ".reasoning.md"),
+                     message.thinking);
+      }
     }
     coder_log = read_text_file(session / "coder.md");
     if (coder_log.empty()) coder_log = "# Coder session\n\n";
@@ -871,7 +1047,7 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
     coder_log += "\n## Resumed\n\n";
     if (!recovered_log.empty()) coder_log += recovered_log;
     write_atomic(session / "coder.md", coder_log);
-    status("Coder: loaded " + std::to_string(saved_messages.size()) +
+    hooks.log("Coder: loaded " + std::to_string(saved_messages.size()) +
            " saved messages; continuing at turn " +
            std::to_string(assistant_count + 1) + ".");
   } else {
@@ -888,17 +1064,16 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
   }
 
   if (pending_assistant) {
-    status("Coder: saved turn " + std::to_string(response_turn) +
+    hooks.log("Coder: saved turn " + std::to_string(response_turn) +
            " has an action that was not applied yet; asking again.");
     // The assistant reply is durable but the tool result is not. There is no
-    // unfinished generation to protect, so keep raw.jsonl; the next generated
-    // turn gets a new turn number.
+    // unfinished generation to protect, so keep its raw log untouched.
   } else if (reuse_transcript) {
-    // The last saved message is a user message, so a generation may have been
-    // interrupted before its assistant reply was recorded. RawRecorder appends
-    // and read_raw_text selects by turn, so the abandoned partial answer would
-    // otherwise be glued to the regenerated one.
-    move_aside(coder_raw_path);
+    hooks.stage(Stage::Coder, StageStatus::Saved,
+                "Loaded the saved Coder conversation.");
+    hooks.log("Coder: the saved conversation ends before a reply for turn " +
+           std::to_string(assistant_count + 1) +
+           "; any partial stream is set aside.");
   }
 
   const int max_turns = std::clamp(config_.max_turns, 1, 500);
@@ -941,7 +1116,7 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
              << "\nSize: " << action.content.size() << " bytes\n\n"
              << action.content
              << "\n\nApprove this exact file content?";
-      if (confirm(review.str())) {
+      if (hooks.ask(review.str())) {
         return write_file(root, session, action.path, action.content, turn);
       }
       return "User declined this file write. The file was not changed.";
@@ -956,7 +1131,7 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
              << "\nTimeout: " << timeout << " seconds\n"
              << "Working directory: project root\n\n"
              << "Approve this exact command?";
-      if (confirm(review.str())) {
+      if (hooks.ask(review.str())) {
         return run_command(root, action.command, timeout,
                            &process_cancel_token());
       }
@@ -972,20 +1147,13 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
   std::unique_ptr<ActiveSessionGuard> active;
   auto ensure_model = [&]() -> InferenceSession& {
     if (!coder_model) {
-      status("Coder: " + (config_.coder.model.empty() ? config_.coder.gguf_path
+      hooks.log("Coder: " + (config_.coder.model.empty() ? config_.coder.gguf_path
                                                        : config_.coder.model));
-      coder_model = std::make_unique<InferenceSession>(config_.coder, status, &process_cancel_token());
+      coder_model = std::make_unique<InferenceSession>(config_.coder, hooks.status_callback(), hooks.cancel);
       active =
           std::make_unique<ActiveSessionGuard>(active_session_, *coder_model);
     }
     return *coder_model;
-  };
-  std::unique_ptr<RawRecorder> coder_recorder;
-  auto ensure_recorder = [&]() -> RawRecorder& {
-    if (!coder_recorder) {
-      coder_recorder = std::make_unique<RawRecorder>(coder_raw_path);
-    }
-    return *coder_recorder;
   };
 
   int next_turn = assistant_count + 1;
@@ -1009,16 +1177,33 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
         coder_messages.erase(coder_messages.begin() + 2,
                              coder_messages.begin() + 4);
       }
-      status("Coder turn " + std::to_string(next_turn) + " of " +
+      hooks.log("Coder turn " + std::to_string(next_turn) + " of " +
              std::to_string(max_turns));
-      RawRecorder& recorder = ensure_recorder();
-      recorder.begin_group(next_turn);
+      const auto coder_raw_path = call_raw_path(session, "coder", next_turn);
+      const auto coder_meta_path = call_meta_path(session, "coder", next_turn);
+      // A partial stream from an interrupted turn must be set aside before the
+      // retry starts, or replaying it would concatenate both answers. The old
+      // file stays in the session for inspection.
+      move_aside(coder_raw_path);
+      move_aside(coder_meta_path);
       InferenceSession& model = ensure_model();
-      model.generate(coder_messages, wrap_tokens(recorder, next_turn));
+      hooks.stage(Stage::Coder, StageStatus::Running,
+                  "Coder turn " + std::to_string(next_turn));
+      {
+        RawByteRecorder recorder(coder_raw_path);
+        write_call_metadata(coder_meta_path, config_.coder.provider);
+        model.generate(coder_messages,
+                       [&recorder](const std::string& bytes) {
+                         recorder.append(bytes);
+                       },
+                       wrap_chunks(Stage::Coder));
+      }
 
-      const std::string response_raw =
-          read_raw_text(coder_raw_path, next_turn);
-      const auto response = extract_thinking(response_raw);
+      const ProviderKind coder_provider =
+          read_provider_kind(coder_meta_path, provider_kind(config_.coder.provider));
+      const ReplayResult response =
+          replay(read_raw_bytes(coder_raw_path), coder_provider);
+      const std::string response_reasoning = response.reasoning;
       response_content = response.content;
       response_turn = next_turn;
 
@@ -1029,13 +1214,12 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
       if (!rejection.empty()) {
         const auto archived = archive_rejected_reply(
             session, response_turn, rejection, response.content,
-            response.thinking);
+            response_reasoning);
         ++rejected_attempts;
-        // The raw log holds this reply under the current turn. Close it before
-        // moving it aside so the retry starts a new stream; read_raw_text would
-        // otherwise concatenate both replies.
-        coder_recorder.reset();
+        // The recorder is closed above, so the rejected stream can be moved
+        // aside before the retry creates a new file at the same call path.
         move_aside(coder_raw_path);
+        move_aside(coder_meta_path);
         if (rejected_attempts >= 2) {
           throw std::runtime_error(
               "Coder produced two replies that were not valid actions for "
@@ -1053,7 +1237,7 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
                      archived.filename().string() + ".\n\n";
         coder_log += "### Correction\n\n" + correction + "\n\n";
         write_atomic(session / "coder.md", coder_log);
-        status("Coder: turn " + std::to_string(response_turn) +
+        hooks.log("Coder: turn " + std::to_string(response_turn) +
                " reply rejected (" + rejection + "); asking once more.");
         continue;
       }
@@ -1061,20 +1245,24 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
       // The reply is a usable action. This append is the commit point. If the
       // process dies after it, resume knows the reply exists and will not ask
       // the model for it again.
-      persist_message("assistant", response.content, response.thinking,
+      persist_message("assistant", response.content, response_reasoning,
                       response_turn);
       coder_messages.emplace_back("assistant", response.content);
       coder_log += "## Turn " + std::to_string(response_turn) + "\n\n";
-      if (!response.thinking.empty()) {
-        coder_log += "### Thinking\n\n" + response.thinking + "\n\n";
-        write_atomic(session / ("coder_turn_" +
-                                std::to_string(response_turn) + "_thinking.md"),
-                     response.thinking);
+      if (!response_reasoning.empty()) {
+        coder_log += "### Thinking\n\n" + response_reasoning + "\n\n";
+        write_atomic(session / ("coder-turn-" +
+                                std::to_string(response_turn) +
+                                ".reasoning.md"),
+                     response_reasoning);
       }
       coder_log += "### Coder response\n\n" + response.content + "\n\n";
       write_atomic(session / "coder.md", coder_log);
       save_manifest(session, "coder-turn-" +
                                  std::to_string(response_turn));
+      hooks.stage(Stage::Coder, StageStatus::Saved,
+                  "Coder turn " + std::to_string(response_turn) +
+                      " reply saved.");
       pending_assistant = true;
       ++next_turn;
       rejected_attempts = 0;
@@ -1093,10 +1281,13 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
         write_atomic(session / "coder.md", coder_log);
         save_manifest(session, "finished");
         if (coder_model) coder_model->release();
-        status("Finished: " + tool_result + "\nSession artifacts: " +
+        hooks.stage(Stage::Coder, StageStatus::Saved, "Session finished.");
+        hooks.log("Finished: " + tool_result + "\nSession artifacts: " +
                session.string());
         return;
       }
+      hooks.stage(Stage::Coder, StageStatus::Running,
+                  "Coder turn " + std::to_string(response_turn) + " action");
       tool_result = execute_action(action, response_turn);
     } catch (const std::exception& error) {
       tool_result = std::string("Tool error: ") + error.what();

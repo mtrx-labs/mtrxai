@@ -12,10 +12,10 @@
 #include "mtrxai/files.hpp"
 #include "mtrxai/pipeline.hpp"
 #include "mtrxai/provider.hpp"
+#include "mtrxai/provider_stream.hpp"
 #include "mtrxai/safety.hpp"
 #include "mtrxai/session.hpp"
 #include "mtrxai/signals.hpp"
-#include "mtrxai/stream_parse.hpp"
 #include "mtrxai/textutil.hpp"
 #include "mtrxai/utf8.hpp"
 
@@ -248,86 +248,98 @@ TEST_CASE("utf8 cursor helpers step over multibyte characters") {
   CHECK_FALSE(mtrxai::utf8_is_continuation(text[1]));
 }
 
-TEST_CASE("stream parsers decode SSE payloads") {
-  CHECK(mtrxai::stream::sse_payload("data: {\"x\":1}") == "{\"x\":1}");
-  CHECK(mtrxai::stream::sse_payload("data: [DONE]") == "[DONE]");
-  CHECK(mtrxai::stream::sse_payload("data:") == "");
-  CHECK(mtrxai::stream::sse_payload(": keepalive") == "");
-  CHECK(mtrxai::stream::sse_payload("event: content_block_delta") == "");
+TEST_CASE("raw bytes and provider replay agree for every split boundary") {
+  struct Case {
+    mtrxai::ProviderKind kind;
+    std::string raw;
+    std::string content;
+    std::string reasoning;
+  };
+  const std::vector<Case> cases = {
+      {mtrxai::ProviderKind::Ollama,
+       "{\"message\":{\"thinking\":\"plan\"}}\n"
+       "{\"message\":{\"content\":\"hello\"}}\n",
+       "hello", "plan"},
+      {mtrxai::ProviderKind::OpenAI,
+       "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan\"}}]}\n\n"
+       "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"
+       "data: [DONE]\n\n",
+       "hello", "plan"},
+      {mtrxai::ProviderKind::Anthropic,
+       "event: content_block_delta\n"
+       "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"plan\"}}\n\n"
+       "event: content_block_delta\n"
+       "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n"
+       "data: {\"type\":\"message_stop\"}\n\n",
+       "hello", "plan"},
+  };
+
+  for (std::size_t provider = 0; provider < cases.size(); ++provider) {
+    const auto& test = cases[provider];
+    for (std::size_t split = 0; split <= test.raw.size(); ++split) {
+      const auto dir = std::filesystem::temp_directory_path() /
+                       ("mtrxai_raw_boundary_" + std::to_string(::getpid()));
+      std::filesystem::remove_all(dir);
+      const auto raw_path = dir / "chief" / "call-1.raw";
+      const auto meta_path = dir / "chief" / "call-1.meta.json";
+      std::filesystem::create_directories(meta_path.parent_path());
+      std::string provider_name = mtrxai::provider_kind_name(test.kind);
+      mtrxai::write_atomic(meta_path,
+                           "{\"provider_kind\":\"" + provider_name + "\"}");
+      mtrxai::RawByteRecorder recorder(raw_path);
+      mtrxai::ReplayParser live(test.kind);
+      std::vector<mtrxai::StreamChunk> events;
+      const auto sink = [&events](const mtrxai::StreamChunk& chunk) {
+        events.push_back(chunk);
+      };
+      const std::string first = test.raw.substr(0, split);
+      const std::string second = test.raw.substr(split);
+      recorder.append(first);
+      live.append(first, sink);
+      recorder.append(second);
+      live.append(second, sink);
+      live.finish(sink);
+
+      const std::string raw_on_disk = mtrxai::read_raw_bytes(raw_path);
+      CHECK(raw_on_disk == test.raw);
+      const auto replayed = mtrxai::replay(raw_on_disk, test.kind);
+      CHECK(replayed.content == test.content);
+      CHECK(replayed.reasoning == test.reasoning);
+      std::string live_content;
+      std::string live_reasoning;
+      for (const auto& event : events) {
+        (event.kind == mtrxai::StreamChunk::Kind::Content
+             ? live_content
+             : live_reasoning) += event.text;
+      }
+      CHECK(live_content == replayed.content);
+      CHECK(live_reasoning == replayed.reasoning);
+      CHECK(std::filesystem::exists(meta_path));
+      const auto mode = std::filesystem::status(raw_path).permissions();
+      CHECK((mode & std::filesystem::perms::group_all) ==
+            std::filesystem::perms::none);
+      CHECK((mode & std::filesystem::perms::others_all) ==
+            std::filesystem::perms::none);
+      std::filesystem::remove_all(dir);
+    }
+  }
 }
 
-TEST_CASE("stream parsers report embedded errors") {
-  CHECK(mtrxai::stream::error_message("{\"error\":\"boom\"}") == "boom");
-  CHECK(mtrxai::stream::error_message(
-            "{\"error\":{\"message\":\"quota\"}}") == "quota");
-  CHECK(mtrxai::stream::error_message(
-            "{\"type\":\"error\",\"error\":{\"message\":\"overloaded\"}}") ==
-        "overloaded");
-  CHECK(mtrxai::stream::error_message("{\"message\":\"fine\"}") == "");
-}
-
-TEST_CASE("Ollama NDJSON line yields message content") {
-  const std::string line =
-      "{\"model\":\"m\",\"message\":{\"role\":\"assistant\","
-      "\"content\":\"hel\"},\"done\":false}";
-  CHECK(mtrxai::stream::ollama_delta_text(line) == "hel");
-  // Final stats line has no text.
-  CHECK(mtrxai::stream::ollama_delta_text(
-            "{\"done\":true,\"message\":{\"content\":\"\"}}") == "");
-  CHECK(mtrxai::stream::ollama_delta_text("not json") == "");
-}
-
-TEST_CASE("OpenAI delta parser extracts choices[0].delta.content") {
-  const std::string chunk =
-      "{\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}";
-  CHECK(mtrxai::stream::openai_delta_text(chunk) == "lo");
-  // Finish chunk without content.
-  CHECK(mtrxai::stream::openai_delta_text(
-            "{\"choices\":[{\"delta\":{},"
-            "\"finish_reason\":\"stop\"}]}") == "");
-  // Usage-only chunk without choices.
-  CHECK(mtrxai::stream::openai_delta_text(
-            "{\"usage\":{\"total_tokens\":12}}") == "");
-}
-
-TEST_CASE("Anthropic delta parser reads text_delta events") {
-  CHECK(mtrxai::stream::anthropic_delta_text(
-            "{\"type\":\"content_block_delta\","
-            "\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}") == "hi");
-  CHECK(mtrxai::stream::anthropic_delta_text(
-            "{\"type\":\"message_start\",\"message\":{}}") == "");
-  CHECK(mtrxai::stream::anthropic_delta_text(
-            "{\"type\":\"content_block_delta\","
-            "\"delta\":{\"type\":\"input_json_delta\"}}") == "");
-}
-
-TEST_CASE("RawRecorder persists chunks and read_raw_text filters by turn") {
+TEST_CASE("cancelled raw response remains byte exact without derived output") {
   const auto dir = std::filesystem::temp_directory_path() /
-                   ("mtrxai_raw_test_" + std::to_string(::getpid()));
+                   ("mtrxai_raw_cancel_" + std::to_string(::getpid()));
   std::filesystem::remove_all(dir);
-  const auto path = dir / "stage" / "raw.jsonl";
+  const std::string response =
+      "data: {\"choices\":[{\"delta\":{\"content\":\"unfinished\"}}]}\n";
+  const std::string partial = response.substr(0, response.size() / 2);
+  const auto raw_path = dir / "chief" / "call-1.raw";
+  const auto derived_path = dir / "chief.md";
   {
-    mtrxai::RawRecorder recorder(path);
-    recorder.append("hel", 0);
-    recorder.begin_group(1);
-    recorder.append("lo ", 1);
-    recorder.append("wor", 1);
+    mtrxai::RawByteRecorder recorder(raw_path);
+    recorder.append(partial);
   }
-  // Owner-only permissions were applied at creation.
-  const auto mode = std::filesystem::status(path).permissions();
-  CHECK((mode & std::filesystem::perms::group_all) == std::filesystem::perms::none);
-  CHECK((mode & std::filesystem::perms::others_all) == std::filesystem::perms::none);
-  // Whole-file decode; the start marker contributes no text.
-  CHECK(mtrxai::read_raw_text(path) == "hello wor");
-  CHECK(mtrxai::read_raw_text(path, 0) == "hel");
-  CHECK(mtrxai::read_raw_text(path, 1) == "lo wor");
-  // A malformed line is ignored rather than corrupting the stream.
-  {
-    std::ofstream extra(path, std::ios::app);
-    extra << "not json\n";
-    extra << R"({"type":"token","turn":1,"text":"!"})" << "\n";
-  }
-  CHECK(mtrxai::read_raw_text(path, 1) == "lo wor!");
+  CHECK(mtrxai::read_raw_bytes(raw_path) == partial);
+  CHECK_FALSE(std::filesystem::exists(derived_path));
   std::filesystem::remove_all(dir);
 }
 

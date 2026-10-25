@@ -1,7 +1,7 @@
 #include "mtrxai/provider.hpp"
 #include "mtrxai/cancel.hpp"
+#include "mtrxai/provider_stream.hpp"
 #include "mtrxai/signals.hpp"
-#include "mtrxai/stream_parse.hpp"
 
 #include <curl/curl.h>
 #include <json-c/json.h>
@@ -48,7 +48,8 @@ std::filesystem::path llama_log_path(const std::string& role) {
 
 namespace {
 
-using TokenSink = InferenceSession::TokenSink;
+using ChunkSink = InferenceSession::ChunkSink;
+using RawSink = InferenceSession::RawSink;
 
 struct JsonDeleter {
   void operator()(json_object* value) const {
@@ -81,13 +82,9 @@ std::size_t discard_body(char*, std::size_t size, std::size_t count, void*) {
   return size * count;
 }
 
-// Feeds every complete line of a streaming response to the handler. Both SSE
-// and Ollama NDJSON are newline-delimited, so one callback covers all
-// protocols. Stored errors are rethrown after the transfer finishes because
-// exceptions must not escape a curl callback.
 struct StreamContext {
-  std::string pending;
-  std::function<void(const std::string&)> on_line;
+  std::function<void(const std::string&)> on_bytes;
+  std::size_t received = 0;
   std::atomic<bool>* cancelled = nullptr;
   const CancelToken* external_cancel = nullptr;
   std::exception_ptr error;
@@ -99,45 +96,35 @@ struct StreamContext {
            process_cancel_token().cancelled();
   }
 
-  void run_line(const std::string& line) {
-    if (error) return;
-    try {
-      on_line(line);
-    } catch (...) {
-      error = std::current_exception();
-    }
-  }
 };
 
-std::size_t stream_lines(char* data, std::size_t size, std::size_t count,
+std::size_t stream_bytes(char* data, std::size_t size, std::size_t count,
                          void* destination) {
   auto& context = *static_cast<StreamContext*>(destination);
   if (context.cancel_requested()) {
     return 0;  // aborts the transfer with CURLE_WRITE_ERROR
   }
   const std::size_t bytes = size * count;
-  constexpr std::size_t max_buffer = 4 * 1024 * 1024;
-  if (bytes > max_buffer - context.pending.size()) {
+  constexpr std::size_t max_response = 4 * 1024 * 1024;
+  if (bytes > max_response - context.received) {
     context.error = std::make_exception_ptr(
         std::runtime_error("Streaming response exceeded the 4 MiB safety limit"));
     return 0;
   }
-  context.pending.append(data, bytes);
-  std::size_t newline = context.pending.find('\n');
-  while (newline != std::string::npos && !context.error) {
-    std::string line = context.pending.substr(0, newline);
-    context.pending.erase(0, newline + 1);
-    if (!line.empty() && line.back() == '\r') line.pop_back();
-    context.run_line(line);
-    newline = context.pending.find('\n');
+  context.received += bytes;
+  try {
+    context.on_bytes(std::string(data, bytes));
+  } catch (...) {
+    context.error = std::current_exception();
+    return 0;
   }
   return bytes;
 }
 
-// Like post_json but line-oriented; used for every generation request.
-void post_json_lines(
+// Save and parse each exact response-body callback before asking curl for more.
+void post_json_stream(
     const std::string& url, const std::string& body,
-    const std::function<void(const std::string&)>& on_line,
+    const std::function<void(const std::string&)>& on_bytes,
     const std::string& api_key = "",
     const std::vector<std::string>& extra_headers = {},
     std::atomic<bool>* cancelled = nullptr,
@@ -145,7 +132,7 @@ void post_json_lines(
   CURL* curl = curl_easy_init();
   if (curl == nullptr) throw std::runtime_error("Could not create HTTP request");
   StreamContext context;
-  context.on_line = on_line;
+  context.on_bytes = on_bytes;
   context.cancelled = cancelled;
   context.external_cancel = external_cancel;
   long status = 0;
@@ -159,17 +146,11 @@ void post_json_lines(
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
   curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stream_lines);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stream_bytes);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3600);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
   const CURLcode result = curl_easy_perform(curl);
-  // The final line may lack a trailing newline.
-  if (!context.pending.empty() && !context.error) {
-    std::string line = context.pending;
-    if (line.back() == '\r') line.pop_back();
-    context.run_line(line);
-  }
   if (result == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
@@ -185,6 +166,25 @@ void post_json_lines(
     throw std::runtime_error("Model server returned HTTP " +
                              std::to_string(status) + " during streaming");
   }
+}
+
+ReplayResult generate_stream(
+    const std::string& url, const std::string& body,
+    ProviderKind kind, const RawSink& on_raw, const ChunkSink& on_chunk,
+    const std::string& api_key = "",
+    const std::vector<std::string>& extra_headers = {},
+    std::atomic<bool>* cancelled = nullptr,
+    const CancelToken* external_cancel = nullptr) {
+  ReplayParser parser(kind);
+  post_json_stream(
+      url, body,
+      [&](const std::string& bytes) {
+        if (on_raw) on_raw(bytes);
+        parser.append(bytes, on_chunk);
+      },
+      api_key, extra_headers, cancelled, external_cancel);
+  parser.finish(on_chunk);
+  return parser.result();
 }
 
 HttpResponse post_json(const std::string& url, const std::string& body,
@@ -247,7 +247,8 @@ std::string normalize_url(std::string url) {
 
 std::string ollama_generate(const ModelSlot& slot, const Messages& messages,
                             const std::string& base_url,
-                            const TokenSink& on_token,
+                            const RawSink& on_raw,
+                            const ChunkSink& on_chunk,
                             std::atomic<bool>* cancelled,
                             const CancelToken* external_cancel) {
   Json body(json_object_new_object());
@@ -266,33 +267,22 @@ std::string ollama_generate(const ModelSlot& slot, const Messages& messages,
                            json_object_new_int(slot.max_tokens));
   }
   json_object_object_add(body.get(), "options", options.release());
-  std::string content;
-  post_json_lines(
+  const ReplayResult response = generate_stream(
       base_url + "/api/chat",
       json_object_to_json_string_ext(body.get(), JSON_C_TO_STRING_PLAIN),
-      [&](const std::string& line) {
-        if (line.empty()) return;
-        const std::string payload_error = stream::error_message(line);
-        if (!payload_error.empty() && content.empty()) {
-          throw std::runtime_error("Ollama stream reported an error: " +
-                                   payload_error);
-        }
-        const std::string delta = stream::ollama_delta_text(line);
-        if (delta.empty()) return;
-        content += delta;
-        if (on_token) on_token(delta);
-      },
-      "", {}, cancelled, external_cancel);
-  if (content.empty()) {
+      ProviderKind::Ollama, on_raw, on_chunk, "", {}, cancelled,
+      external_cancel);
+  if (response.content.empty()) {
     throw std::runtime_error("Ollama stream produced no content");
   }
-  return content;
+  return response.content;
 }
 
 std::string openai_generate(const ModelSlot& slot, const Messages& messages,
                             const std::string& base_url,
                             const std::string& api_key,
-                            const TokenSink& on_token,
+                            const RawSink& on_raw,
+                            const ChunkSink& on_chunk,
                             std::atomic<bool>* cancelled,
                             const CancelToken* external_cancel) {
   Json body(json_object_new_object());
@@ -305,39 +295,22 @@ std::string openai_generate(const ModelSlot& slot, const Messages& messages,
     json_object_object_add(body.get(), "max_tokens",
                            json_object_new_int(slot.max_tokens));
   }
-  std::string content;
-  post_json_lines(
+  const ReplayResult response = generate_stream(
       base_url + "/chat/completions",
       json_object_to_json_string_ext(body.get(), JSON_C_TO_STRING_PLAIN),
-      [&](const std::string& line) {
-        const std::string payload = stream::sse_payload(line);
-        if (payload.empty() || payload == "[DONE]") return;
-        if (stream::error_message(payload).empty()) {
-          const std::string delta = stream::openai_delta_text(payload);
-          if (!delta.empty()) {
-            content += delta;
-            if (on_token) on_token(delta);
-          }
-          return;
-        }
-        // Some endpoints only flag errors in the first chunks; report the
-        // accumulated content if any arrives before the error.
-        if (content.empty()) {
-          throw std::runtime_error("Endpoint stream reported an error: " +
-                                   stream::error_message(payload));
-        }
-      },
-      api_key, {}, cancelled, external_cancel);
-  if (content.empty()) {
+      ProviderKind::OpenAI, on_raw, on_chunk, api_key, {}, cancelled,
+      external_cancel);
+  if (response.content.empty()) {
     throw std::runtime_error("Endpoint stream produced no content");
   }
-  return content;
+  return response.content;
 }
 
 std::string anthropic_generate(const ModelSlot& slot, const Messages& messages,
                                const std::string& base_url,
                                const std::string& api_key,
-                               const TokenSink& on_token,
+                               const RawSink& on_raw,
+                               const ChunkSink& on_chunk,
                                std::atomic<bool>* cancelled,
                                const CancelToken* external_cancel) {
   Json body(json_object_new_object());
@@ -372,27 +345,15 @@ std::string anthropic_generate(const ModelSlot& slot, const Messages& messages,
   if (endpoint.size() < 3 || endpoint.substr(endpoint.size() - 3) != "/v1") {
     endpoint += "/v1";
   }
-  std::string content;
-  post_json_lines(
+  const ReplayResult response = generate_stream(
       endpoint + "/messages",
       json_object_to_json_string_ext(body.get(), JSON_C_TO_STRING_PLAIN),
-      [&](const std::string& line) {
-        const std::string payload = stream::sse_payload(line);
-        if (payload.empty()) return;
-        if (!stream::error_message(payload).empty() && content.empty()) {
-          throw std::runtime_error("Anthropic stream reported an error: " +
-                                   stream::error_message(payload));
-        }
-        const std::string delta = stream::anthropic_delta_text(payload);
-        if (delta.empty()) return;
-        content += delta;
-        if (on_token) on_token(delta);
-      },
-      "", headers, cancelled, external_cancel);
-  if (content.empty()) {
+      ProviderKind::Anthropic, on_raw, on_chunk, "", headers, cancelled,
+      external_cancel);
+  if (response.content.empty()) {
     throw std::runtime_error("Anthropic stream produced no content");
   }
-  return content;
+  return response.content;
 }
 
 unsigned short available_port() {
@@ -640,11 +601,28 @@ InferenceSession::~InferenceSession() noexcept {
 }
 
 std::string InferenceSession::generate(const Messages& messages) {
-  return generate(messages, TokenSink());
+  return generate(messages, ChunkSink());
 }
 
 std::string InferenceSession::generate(const Messages& messages,
                                        const TokenSink& on_token) {
+  ChunkSink chunk_sink;
+  if (on_token) {
+    chunk_sink = [&on_token](const StreamChunk& chunk) {
+      if (chunk.kind == StreamChunk::Kind::Content) on_token(chunk.text);
+    };
+  }
+  return generate(messages, chunk_sink);
+}
+
+std::string InferenceSession::generate(const Messages& messages,
+                                       const ChunkSink& on_chunk) {
+  return generate(messages, RawSink(), on_chunk);
+}
+
+std::string InferenceSession::generate(const Messages& messages,
+                                       const RawSink& on_raw,
+                                       const ChunkSink& on_chunk) {
   if (impl_->released) {
     throw std::runtime_error("Cannot generate after the model stage is unloaded.");
   }
@@ -655,16 +633,17 @@ std::string InferenceSession::generate(const Messages& messages,
     throw Cancelled();
   }
   if (impl_->slot.provider == "ollama") {
-    return ollama_generate(impl_->slot, messages, impl_->base_url, on_token,
-                           &impl_->cancelled, impl_->external_cancel);
+    return ollama_generate(impl_->slot, messages, impl_->base_url, on_raw,
+                           on_chunk, &impl_->cancelled,
+                           impl_->external_cancel);
   }
   if (impl_->slot.provider == "anthropic") {
     return anthropic_generate(impl_->slot, messages, impl_->base_url,
-                              impl_->api_key, on_token, &impl_->cancelled,
-                              impl_->external_cancel);
+                              impl_->api_key, on_raw, on_chunk,
+                              &impl_->cancelled, impl_->external_cancel);
   }
   return openai_generate(impl_->slot, messages, impl_->endpoint, impl_->api_key,
-                         on_token, &impl_->cancelled,
+                         on_raw, on_chunk, &impl_->cancelled,
                          impl_->external_cancel);
 }
 

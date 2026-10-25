@@ -2,6 +2,7 @@
 
 #include "mtrxai/cancel.hpp"
 #include "mtrxai/config.hpp"
+#include "mtrxai/events.hpp"
 
 #include <atomic>
 #include <filesystem>
@@ -31,6 +32,11 @@ class InferenceSession {
   using Status = std::function<void(const std::string&)>;
   // Receives each decoded text chunk as the model streams it. Must not throw.
   using TokenSink = std::function<void(const std::string&)>;
+  // Chunk-aware sink used by the pipeline; reasoning is never mixed into
+  // content. Must not throw.
+  using ChunkSink = std::function<void(const StreamChunk&)>;
+  // Receives exact response body bytes before the decoder sees them.
+  using RawSink = std::function<void(const std::string&)>;
 
   // The optional token aborts model loading and generation. The process-wide
   // SIGINT/SIGTERM token is always checked as well.
@@ -44,6 +50,11 @@ class InferenceSession {
   std::string generate(const Messages& messages);
   // Same request, but every text chunk is also passed to on_token.
   std::string generate(const Messages& messages, const TokenSink& on_token);
+  // Streaming variant that reports content and reasoning separately.
+  std::string generate(const Messages& messages, const ChunkSink& on_chunk);
+  // Raw bytes are persisted by on_raw before being decoded for on_chunk.
+  std::string generate(const Messages& messages, const RawSink& on_raw,
+                       const ChunkSink& on_chunk);
 
   // Request cancellation of an in-flight generate(); the running request
   // is aborted with Cancelled. Clear before starting the next request.

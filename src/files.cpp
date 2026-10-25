@@ -1,7 +1,5 @@
 #include "mtrxai/files.hpp"
 
-#include <json-c/json.h>
-
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -10,7 +8,6 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
-#include <memory>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -130,150 +127,76 @@ void write_atomic(const std::filesystem::path& path, const std::string& content,
   }
 }
 
-namespace {
-
-struct JsonDeleter {
-  void operator()(json_object* value) const {
-    if (value != nullptr) json_object_put(value);
-  }
-};
-using OwnedJson = std::unique_ptr<json_object, JsonDeleter>;
-
-long long wall_clock_ms() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-             std::chrono::system_clock::now().time_since_epoch())
-      .count();
-}
-
-}  // namespace
-
-RawRecorder::RawRecorder(const std::filesystem::path& path) : path_(path) {
+RawByteRecorder::RawByteRecorder(const std::filesystem::path& path)
+    : path_(path) {
   std::error_code error;
   std::filesystem::create_directories(path_.parent_path(), error);
   if (error) {
-    throw std::runtime_error("Could not create raw log directory: " +
+    throw std::runtime_error("Could not create raw response directory: " +
                              error.message());
   }
-  descriptor_ = open(path_.c_str(), O_CREAT | O_WRONLY | O_APPEND, 0600);
+  descriptor_ = open(path_.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0600);
   if (descriptor_ < 0) {
-    throw std::runtime_error("Could not open raw log file " + path_.string() +
+    throw std::runtime_error("Could not open raw response " + path_.string() +
                              ": " + std::strerror(errno));
   }
-  open_ = true;
 }
 
-RawRecorder::~RawRecorder() {
-  // A final sync runs even when the caller forgot finish(); on error paths we
-  // still want everything we have on stable storage.
-  if (open_) {
-    flush(true);
+RawByteRecorder::~RawByteRecorder() {
+  if (descriptor_ >= 0) {
+    fsync(descriptor_);
     close(descriptor_);
   }
 }
 
-void RawRecorder::flush(bool force) {
-  if (!open_) return;
-  const long long now = wall_clock_ms();
-  if (!force && last_sync_ms_ != 0 && now - last_sync_ms_ < 800) return;
-  if (fsync(descriptor_) == 0) last_sync_ms_ = now;
-  // A failed fsync is not fatal by itself: the data is already in the page
-  // cache and the next attempt will retry after ~1 s.
-}
-
-void RawRecorder::append(const std::string& text, int turn) {
-  OwnedJson line(json_object_new_object());
-  json_object_object_add(line.get(), "type",
-                         json_object_new_string("token"));
-  json_object_object_add(line.get(), "turn", json_object_new_int(turn));
-  json_object_object_add(line.get(), "t", json_object_new_int64(wall_clock_ms()));
-  json_object_object_add(line.get(), "text",
-                         json_object_new_string(text.c_str()));
-  std::string serialized =
-      json_object_to_json_string_ext(line.get(), JSON_C_TO_STRING_PLAIN) +
-      std::string("\n");
+void RawByteRecorder::append(const std::string& bytes) {
   std::size_t written = 0;
-  while (written < serialized.size()) {
-    const ssize_t count = write(descriptor_, serialized.data() + written,
-                                serialized.size() - written);
+  while (written < bytes.size()) {
+    const ssize_t count = write(descriptor_, bytes.data() + written,
+                                bytes.size() - written);
     if (count < 0 && errno == EINTR) continue;
     if (count <= 0) {
-      throw std::runtime_error("Could not append to raw log " + path_.string() +
-                               ": " + std::strerror(errno));
+      throw std::runtime_error("Could not append raw response " +
+                               path_.string() + ": " + std::strerror(errno));
     }
     written += static_cast<std::size_t>(count);
   }
-  flush(false);
-}
-
-void RawRecorder::begin_group(int turn) {
-  OwnedJson line(json_object_new_object());
-  json_object_object_add(line.get(), "type",
-                         json_object_new_string("start"));
-  json_object_object_add(line.get(), "turn", json_object_new_int(turn));
-  json_object_object_add(line.get(), "t", json_object_new_int64(wall_clock_ms()));
-  const std::string serialized =
-      std::string(json_object_to_json_string_ext(line.get(),
-                                                 JSON_C_TO_STRING_PLAIN)) + "\n";
-  const ssize_t count = write(descriptor_, serialized.data(), serialized.size());
-  if (count < 0) {
-    throw std::runtime_error("Could not append to raw log " + path_.string() +
-                             ": " + std::strerror(errno));
+  // write(2) makes every callback's bytes visible immediately. Sync durable
+  // storage at a bounded interval to avoid one fsync per tiny network chunk.
+  const auto now = std::chrono::steady_clock::now().time_since_epoch();
+  const auto now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+  if (last_sync_ms_ == 0 || now_ms - last_sync_ms_ >= 1000) {
+    if (fsync(descriptor_) != 0) {
+      throw std::runtime_error("Could not sync raw response " + path_.string() +
+                               ": " + std::strerror(errno));
+    }
+    last_sync_ms_ = now_ms;
   }
-  flush(false);
 }
 
-std::string read_raw_text(const std::filesystem::path& path, int turn) {
-  std::error_code error;
-  if (!std::filesystem::exists(path, error) || error) return {};
+std::string read_raw_bytes(const std::filesystem::path& path) {
   const int descriptor = open(path.c_str(), O_RDONLY);
   if (descriptor < 0) {
-    throw std::runtime_error("Could not read raw log " + path.string() + ": " +
-                             std::strerror(errno));
+    throw std::runtime_error("Could not read raw response " + path.string() +
+                             ": " + std::strerror(errno));
   }
-  std::string buffer;
-  char chunk[8192];
+  std::string result;
+  char buffer[8192];
   while (true) {
-    const ssize_t count = read(descriptor, chunk, sizeof(chunk));
+    const ssize_t count = read(descriptor, buffer, sizeof(buffer));
+    if (count < 0 && errno == EINTR) continue;
     if (count < 0) {
-      if (errno == EINTR) continue;
+      const std::string message = std::strerror(errno);
       close(descriptor);
-      throw std::runtime_error("Could not read raw log " + path.string() + ": " +
-                               std::strerror(errno));
+      throw std::runtime_error("Could not read raw response " + path.string() +
+                               ": " + message);
     }
     if (count == 0) break;
-    buffer.append(chunk, static_cast<std::size_t>(count));
+    result.append(buffer, static_cast<std::size_t>(count));
   }
   close(descriptor);
-
-  std::string text;
-  std::size_t position = 0;
-  while (position < buffer.size()) {
-    const std::size_t newline = buffer.find('\n', position);
-    const std::size_t end = newline == std::string::npos ? buffer.size() : newline;
-    const std::string line = buffer.substr(position, end - position);
-    position = newline == std::string::npos ? buffer.size() : newline + 1;
-    if (line.empty()) continue;
-    OwnedJson parsed(json_tokener_parse(line.c_str()));
-    if (!parsed) continue;
-    json_object* record_type = nullptr;
-    if (json_object_object_get_ex(parsed.get(), "type", &record_type) &&
-        std::string(json_object_get_string(record_type)) != "token") {
-      continue;
-    }
-    if (turn >= 0) {
-      json_object* line_turn = nullptr;
-      if (json_object_object_get_ex(parsed.get(), "turn", &line_turn) &&
-          json_object_get_int(line_turn) != turn) {
-        continue;
-      }
-    }
-    json_object* value = nullptr;
-    if (json_object_object_get_ex(parsed.get(), "text", &value) &&
-        json_object_is_type(value, json_type_string)) {
-      text += json_object_get_string(value);
-    }
-  }
-  return text;
+  return result;
 }
 
 }  // namespace mtrxai

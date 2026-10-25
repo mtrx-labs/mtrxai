@@ -197,6 +197,7 @@ def check_esc_cancellation(binary, root):
     # A stage only consumes its scripted answer when the response was fully
     # delivered, so an Esc-aborted chief request does not shift later answers.
     served = {"chief": 0, "prompter": 0, "coder": 0}
+    sent_responses = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -220,6 +221,7 @@ def check_esc_cancellation(binary, root):
             self.end_headers()
             # The chief streams slowly so the test can press Esc mid-request.
             interval = 0.25 if role == "chief" else 0.0
+            wire_response = bytearray()
             try:
                 for start in range(0, len(content), 9):
                     if interval:
@@ -228,13 +230,17 @@ def check_esc_cancellation(binary, root):
                         {"type": "content_block_delta",
                          "delta": {"type": "text_delta",
                                    "text": content[start:start + 9]}})
-                    self.wfile.write(f"data: {event}\n\n".encode())
+                    wire = f"data: {event}\n\n".encode()
+                    wire_response.extend(wire)
+                    self.wfile.write(wire)
                     self.wfile.flush()
+                wire_response.extend(b"data: {\"type\":\"message_stop\"}\n\n")
                 self.wfile.write(b"data: {\"type\":\"message_stop\"}\n\n")
                 self.wfile.flush()
                 served[role] = index + 1
             except (BrokenPipeError, ConnectionResetError):
                 pass  # the client aborted; leave `served` untouched
+            sent_responses.append(bytes(wire_response))
 
         def log_message(self, *_args):
             pass
@@ -286,16 +292,16 @@ def check_esc_cancellation(binary, root):
         if target not in output:
             raise AssertionError(
                 f"Timed out waiting for {needle!r}: "
-                f"{output.decode(errors='replace')[-1500:]}")
+                f"{output.decode(errors='replace')[-12000:]}")
 
     try:
         wait_for("Describe what you want to build")
         os.write(master, b"make hello.txt\n")
         output.clear()
-        # Early chief tokens prove streaming started; Esc now interrupts the
-        # open request instead of merely declining a review. "think" is part of
-        # the streamed <think> block, so it appears only once tokens arrive.
-        wait_for("think")
+        # Visible Chief content proves streaming started; Esc now interrupts
+        # the open request instead of merely declining a review. Reasoning is
+        # delivered as a separate chunk and is not shown by this legacy UI.
+        wait_for("Chief brief:")
         os.write(master, b"\x1b")
         wait_for("Cancelled. Completed stage outputs remain saved on disk.")
         time.sleep(0.3)
@@ -311,6 +317,30 @@ def check_esc_cancellation(binary, root):
         os.write(master, b"/quit\n")
         assert drain_exit(process, master, 10) == 0
         assert (workspace / "hello.txt").read_text() == "hello-ok\n"
+
+        # The cancelled Chief stream stays on disk as a partial per-call raw
+        # log. It must not be presented as a completed artifact.
+        sessions_root = root / "esc-state" / "mtrxai" / "sessions"
+        session_dirs = [entry for entry in sessions_root.iterdir()
+                        if (entry / "request.md").exists()]
+        assert len(session_dirs) == 2, session_dirs
+        cancelled_session = None
+        for entry in session_dirs:
+            manifest = json.loads((entry / "manifest.json").read_text())
+            if manifest["completed_stage"] == "request":
+                cancelled_session = entry
+                break
+        assert cancelled_session is not None, session_dirs
+        partial_raw = cancelled_session / "chief" / "call-1.raw"
+        assert partial_raw.exists(), partial_raw
+        assert stat.S_IMODE(partial_raw.stat().st_mode) == 0o600
+        partial_text = partial_raw.read_bytes()
+        assert partial_text.strip(), partial_text
+        assert sent_responses[0].startswith(partial_text)
+        meta = cancelled_session / "chief" / "call-1.meta.json"
+        assert json.loads(meta.read_text())["provider_kind"] == "anthropic"
+        assert not (cancelled_session / "chief.md").exists()
+        assert not (cancelled_session / "chief.reasoning.md").exists()
     finally:
         if process.poll() is None:
             process.terminate()
@@ -490,7 +520,7 @@ def check_resume(binary, root):
         if target not in output:
             raise AssertionError(
                 f"Timed out waiting for {needle!r}: "
-                f"{output.decode(errors='replace')[-1500:]}")
+                f"{output.decode(errors='replace')[-12000:]}")
 
     def stop(process, master):
         if process.poll() is None:
@@ -552,8 +582,8 @@ def check_resume(binary, root):
             os.write(master, character.encode())
             time.sleep(0.15)
         wait_for(output, master, "Saved sessions")
-        assert session.name.encode() in output
-        assert finished.name.encode() in output
+        wait_for(output, master, session.name)
+        wait_for(output, master, finished.name)
         os.write(master, b" ")
         wait_for(output, master, "Describe what you want to build")
         os.write(master, b"/quit\n")
@@ -579,7 +609,7 @@ def check_resume(binary, root):
     assert records[3]["content"].startswith(
         "Tool result:\nSaved hello-resume.txt")
     assert json.loads(records[4]["content"])["action"] == "finish"
-    assert (session / "coder_turn_1_thinking.md").read_text().strip() == \
+    assert (session / "coder-turn-1.reasoning.md").read_text().strip() == \
         "Coder thinking process"
     # The finish request after resume carried the persisted tool result, so it
     # was a continuation rather than a fresh Coder conversation.
@@ -779,9 +809,10 @@ def check_resume(binary, root):
     transcript_text = bad_transcript.read_text()
     assert "Sorry, I cannot answer that." not in transcript_text
     assert "delete_everything" not in transcript_text
-    raw_asides = list((bad_session / "coder").glob("raw.jsonl.before-resume-*"))
+    raw_asides = list((bad_session / "coder").glob(
+        "call-1.raw.before-resume-*"))
     assert len(raw_asides) == 2, raw_asides
-    assert not (bad_session / "coder" / "raw.jsonl").exists()
+    assert not (bad_session / "coder" / "call-1.raw").exists()
     manifest = json.loads((bad_session / "manifest.json").read_text())
     assert manifest["completed_stage"] == "prompter", manifest
 
@@ -875,8 +906,9 @@ def check_resume(binary, root):
     assert "Your previous reply was rejected" in records[-1]["content"]
     assert not any(record["role"] == "assistant" and
                    "explode" in record["content"] for record in records)
-    assert list((saved_root / "coder").glob("raw.jsonl.before-resume-*"))
-    assert not (saved_root / "coder" / "raw.jsonl").exists()
+    assert list((saved_root / "coder").glob(
+        "call-*.raw.before-resume-*"))
+    assert not (saved_root / "coder" / "call-2.raw").exists()
 
     # The persisted correction survives the abort. This resume gets a valid
     # write and finish, and the model sees the correction in its context.
@@ -926,6 +958,7 @@ def check_signal_handling(binary, root):
     config_path.parent.mkdir(parents=True)
 
     ollama_unloaded = threading.Event()
+    ollama_request_started = threading.Event()
 
     class SignalHandler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -939,6 +972,7 @@ def check_signal_handling(binary, root):
                 self.wfile.write(b"{}")
                 return
             # Hang briefly on /api/chat so SIGINT is received while Ollama is active
+            ollama_request_started.set()
             time.sleep(2)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -977,10 +1011,39 @@ def check_signal_handling(binary, root):
                 except OSError:
                     break
         assert b"Describe what you want to build" in output
+        deadline = time.time() + 2
+        while b"MESSAGE" not in output and time.time() < deadline:
+            readable, _, _ = select.select([master], [], [], 0.1)
+            if readable:
+                try:
+                    output.extend(os.read(master, 4096))
+                except OSError:
+                    break
+        assert b"MESSAGE" in output, output.decode(errors="replace")[-2000:]
 
-        os.write(master, b"Test task\n")
-        # Give it a moment to initiate the Ollama call
-        time.sleep(0.3)
+        os.write(master, b"Test task")
+        deadline = time.time() + 2
+        while b"Test task" not in output and time.time() < deadline:
+            readable, _, _ = select.select([master], [], [], 0.1)
+            if readable:
+                try:
+                    output.extend(os.read(master, 4096))
+                except OSError:
+                    break
+        assert b"Test task" in output, output.decode(errors="replace")[-2000:]
+        os.write(master, b"\n")
+        deadline = time.time() + 4
+        while not ollama_request_started.is_set() and time.time() < deadline:
+            readable, _, _ = select.select([master], [], [], 0.1)
+            if readable:
+                try:
+                    output.extend(os.read(master, 4096))
+                except OSError:
+                    break
+        assert ollama_request_started.is_set(), (
+            "Ollama generation request did not start; process="
+            f"{process.poll()}, output="
+            f"{output.decode(errors='replace')[-4000:]}")
 
         os.kill(process.pid, 2)  # SIGINT
         exit_code = drain_exit(process, master, 5)
@@ -1040,6 +1103,7 @@ def run(binary):
     requests = []
     generated_requests = []
     chat_requests = []
+    served_streams = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -1048,6 +1112,8 @@ def run(binary):
                 generated_requests.append({"path": self.path, "body": body})
                 answer = actions[len(generated_requests) + 1]
                 content = answer if isinstance(answer, str) else json.dumps(answer)
+                if len(generated_requests) == 1:
+                    content = "<think>Coder thinking process</think>" + content
                 response = json.dumps(
                     {"choices": [{"message": {"content": content}}]}
                 ).encode()
@@ -1078,35 +1144,62 @@ def run(binary):
             if self.path == "/api/generate" or not body.get("stream"):
                 raise AssertionError(f"expected a streaming request to {self.path}")
             if self.path == "/v1/messages":
-                # Anthropic streaming: emit the answer as text_delta events.
+                # Anthropic streaming: reasoning is a distinct thinking_delta,
+                # followed by the visible answer as text_delta events.
+                reasoning = ""
+                text = answer
+                if text.startswith("<think>") and "</think>" in text:
+                    end = text.index("</think>")
+                    reasoning = text[len("<think>"):end]
+                    text = text[end + len("</think>"):].lstrip()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
-                for index in range(0, len(answer), 7):
-                    chunk = answer[index:index + 7]
+                wire_response = bytearray()
+                for index in range(0, len(reasoning), 7):
+                    event = json.dumps(
+                        {"type": "content_block_delta",
+                         "delta": {"type": "thinking_delta",
+                                   "thinking": reasoning[index:index + 7]}})
+                    wire = f"data: {event}\n\n".encode()
+                    wire_response.extend(wire)
+                    self.wfile.write(wire)
+                    self.wfile.flush()
+                for index in range(0, len(text), 7):
+                    chunk = text[index:index + 7]
                     event = json.dumps(
                         {"type": "content_block_delta",
                          "delta": {"type": "text_delta", "text": chunk}})
-                    self.wfile.write(f"data: {event}\n\n".encode())
+                    wire = f"data: {event}\n\n".encode()
+                    wire_response.extend(wire)
+                    self.wfile.write(wire)
                     self.wfile.flush()
+                wire_response.extend(b"data: {\"type\":\"message_stop\"}\n\n")
                 self.wfile.write(b"data: {\"type\":\"message_stop\"}\n\n")
                 self.wfile.flush()
+                served_streams.append(bytes(wire_response))
                 return
             # Ollama native chat streaming: one JSON object per line.
             self.send_response(200)
             self.send_header("Content-Type", "application/x-ndjson")
             self.end_headers()
+            wire_response = bytearray()
             for index in range(0, len(answer), 9):
                 chunk = answer[index:index + 9]
                 event = json.dumps(
                     {"model": "prompter-test",
                      "message": {"role": "assistant", "content": chunk},
                      "done": False})
-                self.wfile.write(event.encode() + b"\n")
+                wire = event.encode() + b"\n"
+                wire_response.extend(wire)
+                self.wfile.write(wire)
                 self.wfile.flush()
             event = json.dumps({"model": "prompter-test", "done": True})
-            self.wfile.write(event.encode() + b"\n")
+            wire = event.encode() + b"\n"
+            wire_response.extend(wire)
+            self.wfile.write(wire)
             self.wfile.flush()
+            served_streams.append(bytes(wire_response))
 
         def log_message(self, *_args):
             pass
@@ -1149,6 +1242,7 @@ def run(binary):
     credentials_path = config_path.parent / "credentials.json"
     credentials_path.write_text(json.dumps({"chief": "test-anthropic-key"}))
     credentials_path.chmod(0o600)
+    llama_stream_dir = temp / "llama-streams"
     env = os.environ.copy()
     env.update(
         {
@@ -1158,6 +1252,7 @@ def run(binary):
             "MTRXAI_TEST_TOKEN": "must-not-leak",
             "MTRXAI_TEST_UPSTREAM": f"http://127.0.0.1:{server.server_port}",
             "MTRXAI_TEST_LLAMA_STARTS": str(temp / "llama-starts.jsonl"),
+            "MTRXAI_TEST_LLAMA_STREAM_DIR": str(llama_stream_dir),
             "PATH": str(llama_bin) + os.pathsep + os.environ.get("PATH", ""),
         }
     )
@@ -1300,35 +1395,56 @@ def run(binary):
         assert (session / "chief.md").exists()
         assert (session / "chief.reasoning.md").exists()
         assert (session / "chief.reasoning.md").read_text().strip() == "Chief thinking process"
-        # Raw streams: tokens persisted verbatim before the derived artifacts.
-        for stage in ("chief", "prompt", "coder"):
-            raw_file = session / stage / "raw.jsonl"
+        # Raw streams: one call log per model request, written chunk-first and
+        # owner-only. Derived files are replayed from these logs.
+        for stage in ("chief", "prompt"):
+            raw_file = session / stage / "call-1.raw"
             assert raw_file.exists(), f"Missing raw stream {raw_file}"
             assert stat.S_IMODE(raw_file.stat().st_mode) == 0o600
-        chief_raw_lines = [
-            json.loads(line)
-            for line in
-            (session / "chief" / "raw.jsonl").read_text().splitlines()
-        ]
-        assert all(entry["type"] == "token" for entry in chief_raw_lines)
-        chief_raw_text = "".join(entry["text"] for entry in chief_raw_lines)
-        assert "Chief thinking process" in chief_raw_text
-        assert chief_raw_text.endswith(
+            meta_file = session / stage / "call-1.meta.json"
+            assert meta_file.exists(), meta_file
+            assert json.loads(meta_file.read_text())[
+                "provider_kind"] == ("anthropic" if stage == "chief" else "ollama")
+        coder_raw_files = sorted(
+            (session / "coder").glob("call-*.raw"),
+            key=lambda path: int(path.name.split("-")[1].split(".")[0]))
+        assert len(coder_raw_files) == 16, coder_raw_files
+        assert all((session / "coder" /
+                    raw_file.name.replace(".raw", ".meta.json")).exists()
+                   for raw_file in coder_raw_files)
+        for raw_file in coder_raw_files:
+            assert stat.S_IMODE(raw_file.stat().st_mode) == 0o600
+        assert (session / "chief" / "call-1.raw").read_bytes() == served_streams[0]
+        assert (session / "prompt" / "call-1.raw").read_bytes() == served_streams[1]
+        for index, raw_file in enumerate(coder_raw_files, start=1):
+            assert raw_file.read_bytes() == (
+                llama_stream_dir / f"call-{index}.raw").read_bytes()
+        chief_raw_text = (session / "chief" / "call-1.raw").read_text()
+        prompt_raw_text = (session / "prompt" / "call-1.raw").read_text()
+        assert chief_raw_text.startswith("data: {")
+        assert prompt_raw_text.startswith("{")
+        assert "thinking_delta" in chief_raw_text
+        assert (session / "chief.md").read_text() == (
             "Chief brief: create and verify a generated file.")
+        assert (session / "prompt.md").read_text() == (
+            "Prompter brief: inspect, edit, test, and summarize.")
         # Last Coder turn raw content matches the finish action in coder.md.
-        coder_raw_lines = [
-            json.loads(line)
-            for line in
-            (session / "coder" / "raw.jsonl").read_text().splitlines()
-        ]
-        assert coder_raw_lines[0]["type"] == "start"
-        assert coder_raw_lines[0]["turn"] == 1
-        final_turn = coder_raw_lines[-1]["turn"]
-        final_text = "".join(
-            entry["text"] for entry in coder_raw_lines
-            if entry["type"] == "token" and entry["turn"] == final_turn)
-        assert json.loads(final_text)["action"] == "finish"
-        assert "<think>" not in (session / "chief.md").read_text()
+        final_text = coder_raw_files[-1].read_text()
+        assert "data: [DONE]" in final_text
+        coder_content = []
+        for line in final_text.splitlines():
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:]
+            if payload == "[DONE]":
+                continue
+            delta = json.loads(payload)["choices"][0]["delta"]
+            coder_content.append(delta.get("content", ""))
+        assert json.loads("".join(coder_content))["action"] == "finish"
+        coder_reasoning = (session / "coder-turn-1.reasoning.md").read_text()
+        assert coder_reasoning.strip() == "Coder thinking process"
+        assert not (session / "coder_turn_1_thinking.md").exists()
+        assert "</think>" not in (session / "chief.md").read_text()
         assert (session / "prompt.md").exists()
         coder_log = (session / "coder.md").read_text()
         assert "Created generated.txt and verified it with printf." in coder_log, coder_log
