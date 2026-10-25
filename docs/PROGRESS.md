@@ -20,6 +20,7 @@ to it rather than replacing it.
 - `.github/workflows/ci.yml` builds with `BUILD_TESTING=ON`, asserts `id -u` is not 0, and runs `ctest`.
 - The setup wizard constructs its no-echo guard before printing the secret prompt.
 - The e2e test skips the `/proc/$PPID/environ` permission assertion as root and prints the reason.
+- `AGENTS.md` documents the build, non-root test command, safety constraints, and style rules.
 - Build and ctest pass locally as uid 1000.
 
 **Known risks / not run.** Real Ollama, real GGUF/llama-server, and non-Ubuntu
@@ -44,8 +45,12 @@ needs network access.
 - SIGINT/SIGTERM handlers only set the process token; the pipeline, llama-server startup, command runner, and Coder loop observe it. The TUI stops its worker, unloads Ollama, restores the terminal, and returns `128 + signal` (130 for SIGINT).
 - `Config::max_turns` (default 40) and GGUF load timeout (default 150 s) load from old and new configs.
 
-**Next.** PR 3: `events.hpp`, event-driven pipeline API, streaming reasoning chunks,
-raw-first per-call logs, and replay-derived artifacts.
+**Next.** Phase 2: raw response body bytes, provider-specific replay, and live
+events driven by that same incremental replay parser.
 
 **Known risks / not run.** Real Ollama/GGUF and real Anthropic streaming were not run;
 their protocols are covered by unit tests and mock servers.
+
+**Merge status.** Phase 0 and Phase 1 implementation work is present in local
+commits, but neither is contained in `origin/main` as of the verified remote
+head `5c1b08b`; they are not merged upstream yet.
