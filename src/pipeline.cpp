@@ -623,15 +623,30 @@ std::string read_text_file(const std::filesystem::path& path) {
                      std::istreambuf_iterator<char>());
 }
 
+// Two failed replies for one turn can arrive within the same millisecond, and
+// a same-named archive would otherwise silently replace the earlier evidence.
+std::filesystem::path unused_archive_path(const std::filesystem::path& path) {
+  std::error_code error;
+  if (!std::filesystem::exists(path, error) && !error) return path;
+  for (int suffix = 1; suffix < 1000; ++suffix) {
+    const auto candidate =
+        path.parent_path() /
+        (path.filename().string() + "-" + std::to_string(suffix));
+    if (!std::filesystem::exists(candidate, error) && !error) return candidate;
+  }
+  throw std::runtime_error("Could not find a free archive name for " +
+                           path.string());
+}
+
 // A resumed run may have to ask a model again. Keeping the previous raw log
 // (instead of appending to it) is essential: read_raw_text would otherwise
 // concatenate the abandoned partial answer with the new one.
 void move_aside(const std::filesystem::path& path) {
   std::error_code error;
   if (!std::filesystem::exists(path, error) || error) return;
-  const auto aside =
+  const auto aside = unused_archive_path(
       path.parent_path() /
-      (path.filename().string() + ".before-resume-" + timestamp());
+      (path.filename().string() + ".before-resume-" + timestamp()));
   std::filesystem::rename(path, aside, error);
   if (error) {
     throw std::runtime_error("Could not set aside " + path.string() + ": " +
@@ -656,8 +671,9 @@ std::filesystem::path archive_rejected_reply(
   const std::string label =
       rejection.rfind("Unsupported coder action:", 0) == 0 ? "unsupported"
                                                            : "malformed";
-  const auto path = directory / ("turn-" + std::to_string(turn) + "-" + label +
-                                 "-" + timestamp() + ".md");
+  const auto path = unused_archive_path(
+      directory / ("turn-" + std::to_string(turn) + "-" + label + "-" +
+                   timestamp() + ".md"));
   std::ostringstream archive;
   archive << "# Rejected Coder reply\n\n"
           << "Turn: " << turn << "\n"
