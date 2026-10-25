@@ -31,8 +31,8 @@ never copied or modified by mtrxAI.
 
 ## Build (Linux)
 
-Dependencies: C++17 compiler, CMake 3.20+, ncurses, libcurl, OpenSSL, json-c,
-and pkg-config.
+Dependencies: C++17 compiler, CMake 3.20+, wide ncurses (ncursesw),
+libcurl, OpenSSL, json-c, and pkg-config.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -158,5 +158,9 @@ remain local. Run the mock-provider integration test with
 `ctest --test-dir build --output-on-failure`.
 
 ## License
+
+The TUI runs under the terminal's locale and accepts UTF-8 input (multibyte
+characters are kept intact while typing, moving, and deleting). Set a UTF-8
+locale such as `LANG=C.UTF-8` in your environment for non-ASCII input.
 
 MIT. See [LICENSE](LICENSE).

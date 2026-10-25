@@ -2,11 +2,13 @@
 
 #include "mtrxai/pipeline.hpp"
 #include "mtrxai/signals.hpp"
+#include "mtrxai/utf8.hpp"
 
 #include <ncurses.h>
 
 #include <algorithm>
 #include <cctype>
+#include <cwctype>
 #include <filesystem>
 #include <iostream>
 #include <optional>
@@ -31,6 +33,23 @@ struct ScreenGuard {
     endwin();
   }
 };
+
+// Read one key through ncursesw's get_wch so a typed character arrives as a
+// single wchar_t regardless of how many bytes its UTF-8 form needs. Function
+// and arrow keys are reported as key codes instead.
+struct KeyEvent {
+  bool is_code = true;  // true when this is a KEY_* code, not a character
+  int code = ERR;       // only meaningful when is_code is true
+  wchar_t character = 0;
+};
+
+KeyEvent next_key() {
+  wint_t value = 0;
+  const int status = get_wch(&value);
+  if (status == ERR) return {true, ERR, 0};
+  if (status == KEY_CODE_YES) return {true, static_cast<int>(value), 0};
+  return {false, 0, static_cast<wchar_t>(value)};
+}
 
 std::string safe_terminal_text(const std::string& text) {
   std::string safe;
@@ -198,31 +217,41 @@ std::string input_line(const std::string& initial = {}) {
       refresh();
     }
 
-    const int key = getch();
-    if (key == KEY_RESIZE) continue;
-    if (key == ERR) return {};
-    if (key == '\n' || key == '\r' || key == KEY_ENTER) return value;
-    if (key == 27) return {};
-    if (key == KEY_LEFT) {
-      if (cursor > 0) --cursor;
-    } else if (key == KEY_RIGHT) {
-      if (cursor < value.size()) ++cursor;
-    } else if (key == KEY_HOME || key == 1) {
+    const KeyEvent key = next_key();
+    if (key.is_code && key.code == KEY_RESIZE) continue;
+    if (key.is_code && key.code == ERR) return {};
+    // Enter can arrive as a character code (0) or, rarely, as KEY_ENTER.
+    if ((key.is_code && (key.code == '\n' || key.code == '\r')) ||
+        (!key.is_code && (key.character == L'\n' || key.character == L'\r' ||
+                          key.character == KEY_ENTER))) {
+      return value;
+    }
+    if (!key.is_code && key.character == 27) return {};
+    if (key.is_code && key.code == KEY_LEFT) {
+      if (cursor > 0) cursor = mtrxai::utf8_prev_char_start(value, cursor);
+    } else if (key.is_code && key.code == KEY_RIGHT) {
+      if (cursor < value.size()) cursor = mtrxai::utf8_next_char_end(value, cursor);
+    } else if (key.is_code && (key.code == KEY_HOME || key.code == 1)) {
       cursor = 0;
-    } else if (key == KEY_END || key == 5) {
+    } else if (key.is_code && (key.code == KEY_END || key.code == 5)) {
       cursor = value.size();
-    } else if (key == KEY_BACKSPACE || key == 127 || key == 8) {
+    } else if (key.is_code &&
+               (key.code == KEY_BACKSPACE || key.code == 127 || key.code == 8)) {
       if (cursor > 0) {
-        value.erase(cursor - 1, 1);
-        --cursor;
+        const std::size_t start = mtrxai::utf8_prev_char_start(value, cursor);
+        value.erase(start, cursor - start);
+        cursor = start;
       }
-    } else if (key == KEY_DC) {
-      if (cursor < value.size()) value.erase(cursor, 1);
-    } else if (key >= 0 && key <= 255 &&
-               std::isprint(static_cast<unsigned char>(key)) &&
+    } else if (key.is_code && key.code == KEY_DC) {
+      if (cursor < value.size()) {
+        const std::size_t end = mtrxai::utf8_next_char_end(value, cursor);
+        value.erase(cursor, end - cursor);
+      }
+    } else if (!key.is_code && std::iswprint(key.character) &&
                value.size() < 8191) {
-      value.insert(cursor, 1, static_cast<char>(key));
-      ++cursor;
+      const std::string encoded = mtrxai::utf8_encode(key.character);
+      value.insert(cursor, encoded);
+      cursor += encoded.size();
     }
   }
 }
@@ -306,18 +335,26 @@ std::optional<std::string> read_api_key(const std::string& role) {
        " (input is hidden; Enter saves, Esc cancels).");
   std::string key;
   while (true) {
-    const int character = getch();
-    if (character == ERR || character == 27) return std::nullopt;
-    if (character == '\n' || character == KEY_ENTER) return key;
-    if (character == KEY_BACKSPACE || character == 127 || character == 8) {
-      if (!key.empty()) key.pop_back();
+    const KeyEvent event = next_key();
+    if ((event.is_code && event.code == ERR) ||
+        (!event.is_code && event.character == 27)) {
+      return std::nullopt;
+    }
+    if ((!event.is_code &&
+         (event.character == L'\n' || event.character == L'\r')) ||
+        (event.is_code && (event.code == '\n' || event.code == '\r' ||
+                           event.code == KEY_ENTER))) {
+      return key;
+    }
+    if (event.is_code &&
+        (event.code == KEY_BACKSPACE || event.code == 127 || event.code == 8)) {
+      if (!key.empty()) key.erase(mtrxai::utf8_prev_char_start(key, key.size()));
       show("API key for " + role + "\n" + std::string(key.size(), '*'));
       continue;
     }
-    if (character >= 0 && character <= 255 &&
-        std::isprint(static_cast<unsigned char>(character)) &&
+    if (!event.is_code && std::iswprint(event.character) &&
         key.size() < 4096) {
-      key.push_back(static_cast<char>(character));
+      key += mtrxai::utf8_encode(event.character);
       show("API key for " + role + "\n" + std::string(key.size(), '*'));
     }
   }

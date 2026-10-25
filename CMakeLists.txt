@@ -12,6 +12,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(CURL REQUIRED)
+# Wide ncurses (ncursesw) so multibyte UTF-8 input works in the TUI.
+set(CURSES_NEED_NCURSES TRUE)
+set(CURSES_NEED_WIDE TRUE)
 find_package(Curses REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(PkgConfig REQUIRED)

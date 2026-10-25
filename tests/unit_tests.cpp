@@ -4,6 +4,7 @@
 #include "mtrxai/pipeline.hpp"
 #include "mtrxai/provider.hpp"
 #include "mtrxai/signals.hpp"
+#include "mtrxai/utf8.hpp"
 
 TEST_CASE("llama_log_path uses state home and role") {
   const std::string path = mtrxai::llama_log_path("coder").string();
@@ -152,3 +153,28 @@ TEST_CASE("Config defaults and serialization of turns, timeout, and context") {
   std::filesystem::remove(temp_config_path);
 }
 
+
+TEST_CASE("utf8_encode covers ASCII, two-, three-, and four-byte characters") {
+  CHECK(mtrxai::utf8_encode(L'A') == "A");
+  CHECK(mtrxai::utf8_encode(L'\u00e9') == "\xc3\xa9");            // é
+  CHECK(mtrxai::utf8_encode(L'\u20ac') == "\xe2\x82\xac");        // €
+  CHECK(mtrxai::utf8_encode(L'\U0001F600') == "\xf0\x9f\x98\x80"); // 😀
+  // Out-of-range code points become the replacement character.
+  CHECK(mtrxai::utf8_encode(static_cast<wchar_t>(0x110000)) == "\xef\xbf\xbd");
+}
+
+TEST_CASE("utf8 cursor helpers step over multibyte characters") {
+  const std::string text = "a\u00e9b";  // a, é (2 bytes), b
+  CHECK(text.size() == 4);
+  CHECK(mtrxai::utf8_prev_char_start(text, 4) == 3);
+  CHECK(mtrxai::utf8_prev_char_start(text, 3) == 1);
+  CHECK(mtrxai::utf8_prev_char_start(text, 1) == 0);
+  CHECK(mtrxai::utf8_prev_char_start(text, 0) == 0);
+  CHECK(mtrxai::utf8_next_char_end(text, 0) == 1);
+  CHECK(mtrxai::utf8_next_char_end(text, 1) == 3);
+  CHECK(mtrxai::utf8_next_char_end(text, 3) == 4);
+  CHECK(mtrxai::utf8_next_char_end(text, 4) == 4);
+  // Continuation bytes are never reported as character starts.
+  CHECK(mtrxai::utf8_is_continuation(text[2]));
+  CHECK_FALSE(mtrxai::utf8_is_continuation(text[1]));
+}
