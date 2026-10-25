@@ -1,17 +1,54 @@
 #!/usr/bin/env python3
+import fcntl
 import json
 import os
 import pty
 import select
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+
+def open_sized_pty(rows=40, columns=120):
+    """Open a pty with a real window size.
+
+    A bare pty pair reports 0x0, and FTXUI's fullscreen app renders nothing at
+    that size. Real terminals always advertise their dimensions, so mirror one.
+    """
+    master, slave = pty.openpty()
+    fcntl.ioctl(
+        slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0)
+    )
+    return master, slave
+
+
+def drain_exit(process, master, timeout):
+    """Wait for a pty process while draining its output.
+
+    FTXUI redraws continuously. Once the kernel pty buffer fills, the app blocks
+    writing to stdout and cannot process a quit request or signal, so a plain
+    wait() would deadlock. Keep reading until the process exits.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        readable, _, _ = select.select([master], [], [], 0.05)
+        if readable:
+            try:
+                os.read(master, 65536)
+            except OSError:
+                pass
+        code = process.poll()
+        if code is not None:
+            return code
+    raise subprocess.TimeoutExpired(process.args, timeout)
 
 
 def check_setup_wizard(binary, root):
@@ -24,7 +61,7 @@ def check_setup_wizard(binary, root):
     gguf.write_bytes(b"mock gguf")
     env = os.environ.copy()
     env.update({"HOME": str(user_home), "XDG_CONFIG_HOME": str(config_home), "TERM": "xterm"})
-    master, slave = pty.openpty()
+    master, slave = open_sized_pty()
     process = subprocess.Popen(
         [binary, "--init"], cwd=root, env=env,
         stdin=slave, stdout=slave, stderr=slave,
@@ -66,7 +103,7 @@ def check_setup_wizard(binary, root):
         answer("Anthropic model name", b"wizard-anthropic-model\n")
         answer("Anthropic API key (input is hidden)", b"wizard-anthropic-secret\n")
         wait_for("Setup complete.")
-        assert process.wait(timeout=5) == 0
+        assert drain_exit(process, master, 5) == 0
         assert b"wizard-openai-secret" not in transcript
         assert b"wizard-anthropic-secret" not in transcript
         config_path = config_home / "mtrxai" / "config.json"
@@ -88,7 +125,7 @@ def check_setup_wizard(binary, root):
         }
         assert stat.S_IMODE(credentials_path.stat().st_mode) == 0o600
 
-        ui_master, ui_slave = pty.openpty()
+        ui_master, ui_slave = open_sized_pty()
         ui = subprocess.Popen(
             [binary, "--no-update-check"], cwd=root, env=env,
             stdin=ui_slave, stdout=ui_slave, stderr=ui_slave
@@ -124,7 +161,7 @@ def check_setup_wizard(binary, root):
             os.write(ui_master, b"x")
             wait_ui("Describe what you want to build")
             os.write(ui_master, b"/quit\n")
-            assert ui.wait(timeout=5) == 0
+            assert drain_exit(ui, ui_master, 5) == 0
             assert json.loads(credentials_path.read_text())["prompter"] == (
                 "new-tui-secret"
             )
@@ -228,7 +265,7 @@ def check_esc_cancellation(binary, root):
         "XDG_STATE_HOME": str(root / "esc-state"),
         "TERM": "xterm",
     })
-    master, slave = pty.openpty()
+    master, slave = open_sized_pty()
     process = subprocess.Popen(
         [binary, "--no-update-check"], cwd=workspace, env=env,
         stdin=slave, stdout=slave, stderr=slave
@@ -256,8 +293,8 @@ def check_esc_cancellation(binary, root):
         os.write(master, b"make hello.txt\n")
         output.clear()
         # Early chief tokens prove streaming started; Esc now interrupts the
-        # open request instead of merely declining a review. The needle is a
-        # single streamed fragment because ncurses only writes changed cells.
+        # open request instead of merely declining a review. "think" is part of
+        # the streamed <think> block, so it appears only once tokens arrive.
         wait_for("think")
         os.write(master, b"\x1b")
         wait_for("Cancelled. Completed stage outputs remain saved on disk.")
@@ -272,7 +309,7 @@ def check_esc_cancellation(binary, root):
         os.write(master, b"\n")
         wait_for("Describe what you want to build")
         os.write(master, b"/quit\n")
-        assert process.wait(timeout=10) == 0
+        assert drain_exit(process, master, 10) == 0
         assert (workspace / "hello.txt").read_text() == "hello-ok\n"
     finally:
         if process.poll() is None:
@@ -432,7 +469,7 @@ def check_resume(binary, root):
     })
 
     def start(extra_args, cwd=workspace):
-        master, slave = pty.openpty()
+        master, slave = open_sized_pty()
         process = subprocess.Popen(
             [binary, "--no-update-check"] + extra_args, cwd=cwd,
             env=env, stdin=slave, stdout=slave, stderr=slave
@@ -476,7 +513,7 @@ def check_resume(binary, root):
         os.write(master, b"\n")
         wait_for(output, master, "Describe what you want to build")
         os.write(master, b"/quit\n")
-        assert process.wait(timeout=10) == 0
+        assert drain_exit(process, master, 10) == 0
     finally:
         stop(process, master)
 
@@ -520,7 +557,7 @@ def check_resume(binary, root):
         os.write(master, b" ")
         wait_for(output, master, "Describe what you want to build")
         os.write(master, b"/quit\n")
-        assert process.wait(timeout=10) == 0
+        assert drain_exit(process, master, 10) == 0
     finally:
         stop(process, master)
 
@@ -585,7 +622,7 @@ def check_resume(binary, root):
         os.write(master, b"\n")
         wait_for(output, master, "Describe what you want to build")
         os.write(master, b"/quit\n")
-        assert process.wait(timeout=10) == 0
+        assert drain_exit(process, master, 10) == 0
     finally:
         stop(process, master)
     assert counts == {"chief": 1, "prompter": 1, "coder": 3}, counts
@@ -637,7 +674,7 @@ def check_resume(binary, root):
         os.write(master, b"\n")
         wait_for(output, master, "Describe what you want to build")
         os.write(master, b"/quit\n")
-        assert process.wait(timeout=10) == 0
+        assert drain_exit(process, master, 10) == 0
     finally:
         stop(process, master)
 
@@ -676,7 +713,7 @@ def check_resume(binary, root):
         os.write(master, b"\n")
         wait_for(output, master, "Describe what you want to build")
         os.write(master, b"/quit\n")
-        assert process.wait(timeout=10) == 0
+        assert drain_exit(process, master, 10) == 0
     finally:
         stop(process, master)
     manifest = json.loads((pending_finish / "manifest.json").read_text())
@@ -701,7 +738,7 @@ def check_resume(binary, root):
         os.write(master, b"\n")
         wait_for(output, master, "Describe what you want to build")
         os.write(master, b"/quit\n")
-        assert process.wait(timeout=10) == 0
+        assert drain_exit(process, master, 10) == 0
     finally:
         stop(process, master)
 
@@ -761,7 +798,7 @@ def check_resume(binary, root):
         os.write(master, b"\n")
         wait_for(output, master, "Describe what you want to build")
         os.write(master, b"/quit\n")
-        assert process.wait(timeout=10) == 0
+        assert drain_exit(process, master, 10) == 0
     finally:
         stop(process, master)
 
@@ -811,7 +848,7 @@ def check_resume(binary, root):
         os.write(master, b"\n")
         wait_for(output, master, "Describe what you want to build")
         os.write(master, b"/quit\n")
-        assert process.wait(timeout=10) == 0
+        assert drain_exit(process, master, 10) == 0
     finally:
         stop(process, master)
 
@@ -856,7 +893,7 @@ def check_resume(binary, root):
         os.write(master, b"\n")
         wait_for(output, master, "Describe what you want to build")
         os.write(master, b"/quit\n")
-        assert process.wait(timeout=10) == 0
+        assert drain_exit(process, master, 10) == 0
     finally:
         stop(process, master)
 
@@ -923,7 +960,7 @@ def check_signal_handling(binary, root):
 
     env = os.environ.copy()
     env.update({"HOME": str(user_home), "XDG_CONFIG_HOME": str(config_home), "TERM": "xterm"})
-    master, slave = pty.openpty()
+    master, slave = open_sized_pty()
     process = subprocess.Popen(
         [binary, "--no-update-check"], cwd=root, env=env,
         stdin=slave, stdout=slave, stderr=slave
@@ -946,7 +983,7 @@ def check_signal_handling(binary, root):
         time.sleep(0.3)
 
         os.kill(process.pid, 2)  # SIGINT
-        exit_code = process.wait(timeout=5)
+        exit_code = drain_exit(process, master, 5)
         assert exit_code != 0, f"Expected non-zero exit code on SIGINT, got {exit_code}"
         assert ollama_unloaded.wait(timeout=4), "Ollama keep_alive: 0 unload request was not received on SIGINT"
     finally:
@@ -1124,7 +1161,7 @@ def run(binary):
             "PATH": str(llama_bin) + os.pathsep + os.environ.get("PATH", ""),
         }
     )
-    master, slave = pty.openpty()
+    master, slave = open_sized_pty()
     process = subprocess.Popen(
         [binary, "--no-update-check"], cwd=workspace, env=env,
         stdin=slave, stdout=slave, stderr=slave
@@ -1189,7 +1226,7 @@ def run(binary):
         output.clear()
         wait_for("Describe what you want to build")
         os.write(master, b"/quit\n")
-        assert process.wait(timeout=10) == 0
+        assert drain_exit(process, master, 10) == 0
         assert (workspace / "generated.txt").read_text() == "generated-ok\n"
         assert (workspace / "existing.txt").read_text() == "updated file\n"
         assert not (workspace / "declined.txt").exists()

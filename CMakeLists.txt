@@ -12,13 +12,25 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(CURL REQUIRED)
-# Wide ncurses (ncursesw) so multibyte UTF-8 input works in the TUI.
-set(CURSES_NEED_NCURSES TRUE)
-set(CURSES_NEED_WIDE TRUE)
-find_package(Curses REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(JSONC REQUIRED IMPORTED_TARGET json-c)
+
+# FTXUI supplies the terminal widgets, layout, and input handling for the TUI.
+# Pin a release so builds do not drift; the first configure downloads it, just
+# like doctest below.
+set(FTXUI_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(FTXUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(FTXUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(FTXUI_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+include(FetchContent)
+FetchContent_Declare(
+  ftxui
+  GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI.git
+  GIT_TAG v7.0.3
+  GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(ftxui)
 
 add_library(mtrxai_core STATIC
   src/coder_transcript.cpp
@@ -32,8 +44,15 @@ add_library(mtrxai_core STATIC
   src/tui.cpp
   src/update.cpp
 )
-target_include_directories(mtrxai_core PUBLIC include ${CURSES_INCLUDE_DIRS})
-target_link_libraries(mtrxai_core PUBLIC CURL::libcurl OpenSSL::Crypto ${CURSES_LIBRARIES} PkgConfig::JSONC)
+target_include_directories(mtrxai_core PUBLIC include)
+target_link_libraries(mtrxai_core PUBLIC
+  CURL::libcurl
+  OpenSSL::Crypto
+  PkgConfig::JSONC
+  ftxui::screen
+  ftxui::dom
+  ftxui::component
+)
 target_compile_definitions(mtrxai_core PUBLIC MTRXAI_VERSION="${PROJECT_VERSION}")
 target_compile_options(mtrxai_core PRIVATE -Wall -Wextra -Wpedantic)
 

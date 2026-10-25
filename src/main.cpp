@@ -33,8 +33,8 @@ void usage(const char* program) {
 
 int main(int argc, char** argv) {
   mtrxai::signals::install();
-  // Pick up the user's locale so wide ncurses can decode UTF-8 input; without
-  // this ncurses stays in the C locale and non-ASCII typing does not work.
+  // Pick up the user's locale so the TUI can decode UTF-8 input; without this
+  // the process stays in the C locale and non-ASCII typing does not work.
   std::setlocale(LC_ALL, "");
   try {
     bool skip_update_check = false;

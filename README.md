@@ -31,8 +31,10 @@ never copied or modified by mtrxAI.
 
 ## Build (Linux)
 
-Dependencies: C++17 compiler, CMake 3.20+, wide ncurses (ncursesw),
-libcurl, OpenSSL, json-c, and pkg-config.
+Dependencies: C++17 compiler, CMake 3.20+, libcurl, OpenSSL, json-c, and
+pkg-config. CMake downloads the pinned FTXUI release (MIT) during the first
+configure (and doctest when tests are enabled), so that configure needs network
+access; later builds use the downloaded copies.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -187,8 +189,9 @@ roles to prevent context pollution, and reasoning is saved in separate session
 artifacts (`chief_thinking.md`, `prompt_thinking.md`, `coder_turn_<N>_thinking.md`).
 When running local GGUF models, `llama-server` stdout and stderr are
 redirected to `$XDG_STATE_HOME/mtrxai/logs/<role>.log` (mode 0600) to keep the TUI
-display clean. Signal handlers for SIGINT and SIGTERM cleanly terminate child processes,
-unload active Ollama models, restore the terminal (`endwin()`), and exit non-zero.
+display clean. Signal handlers for SIGINT and SIGTERM cleanly terminate child
+processes and unload active Ollama models; the TUI restores the terminal and
+then exits non-zero.
 Avoid using remote endpoints for workspaces whose contents must
 remain local. Run the mock-provider integration test with
 `ctest --test-dir build --output-on-failure`.
@@ -220,8 +223,14 @@ manifest says `finished` is reported as complete without starting any model.
 
 ## License
 
-The TUI runs under the terminal's locale and accepts UTF-8 input (multibyte
-characters are kept intact while typing, moving, and deleting). Set a UTF-8
-locale such as `LANG=C.UTF-8` in your environment for non-ASCII input.
+The TUI is built with FTXUI and redraws a full-screen layout: assigned roles
+and models in a sidebar, a transcript that follows the newest output, and the
+message box at the bottom. On terminals narrower than 90 columns the sidebar is
+hidden so the transcript keeps the width. Approval screens show the full
+proposed file or command one page at a time, with the current task kept above
+it; use Up/Down or PgUp/PgDn to read every line, then `y` to approve or `n` to
+decline. The TUI runs under the terminal's locale and accepts UTF-8 input
+(multibyte characters are kept intact while typing, moving, and deleting). Set a
+UTF-8 locale such as `LANG=C.UTF-8` in your environment for non-ASCII input.
 
 MIT. See [LICENSE](LICENSE).

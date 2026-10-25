@@ -129,8 +129,6 @@ TEST_CASE("ModelSlot defaults max_tokens to 4096") {
 }
 
 TEST_CASE("signals state tracking methods operate safely") {
-  mtrxai::signals::set_curses_active(true);
-  mtrxai::signals::set_curses_active(false);
   mtrxai::signals::set_active_child(12345);
   mtrxai::signals::set_active_child(0);
   mtrxai::signals::set_active_ollama("http://localhost:11434", "test-model");

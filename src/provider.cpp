@@ -424,7 +424,7 @@ class LlamaServer {
       if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) _exit(126);
       if (getppid() == 1) _exit(1);
 
-      // Redirect stdout and stderr to the role log file so ncurses is not corrupted
+      // Redirect stdout and stderr to the role log file so the TUI is not corrupted
       const int log_fd = open(log_file.c_str(), O_CREAT | O_WRONLY | O_APPEND, 0600);
       if (log_fd >= 0) {
         dup2(log_fd, STDOUT_FILENO);

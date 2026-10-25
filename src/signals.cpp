@@ -5,7 +5,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ncurses.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -18,7 +17,6 @@ namespace mtrxai {
 namespace signals {
 namespace {
 
-std::atomic<bool> g_curses_active{false};
 std::atomic<pid_t> g_active_child{0};
 
 char g_ollama_host[128] = "127.0.0.1";
@@ -90,23 +88,21 @@ void unload_ollama_raw() {
 }
 
 void on_signal(int signum) {
-  // 1. Restore terminal mode if curses was active
-  if (g_curses_active.load()) {
-    g_curses_active.store(false);
-    endwin();
-  }
+  // The TUI installs its own handlers on top of these: FTXUI restores the
+  // terminal, then re-raises, so by the time this runs no screen cleanup is
+  // needed here.
 
-  // 2. Terminate any active child process group / child
+  // 1. Terminate any active child process group / child
   const pid_t child = g_active_child.load();
   if (child > 0) {
     kill(-child, SIGTERM);
     kill(child, SIGTERM);
   }
 
-  // 3. Unload active Ollama model
+  // 2. Unload active Ollama model
   unload_ollama_raw();
 
-  // 4. Exit non-zero
+  // 3. Exit non-zero
   _exit(128 + signum);
 }
 
@@ -120,10 +116,6 @@ void install() {
 
   sigaction(SIGINT, &sa, nullptr);
   sigaction(SIGTERM, &sa, nullptr);
-}
-
-void set_curses_active(bool active) {
-  g_curses_active.store(active);
 }
 
 void set_active_child(pid_t pid) {

@@ -2,7 +2,7 @@
 
 // Small UTF-8 helpers so the TUI can accept non-ASCII input: encode one code
 // point and walk offsets at character (not byte) boundaries. Kept in a header
-// so unit tests can cover them without linking the ncurses UI.
+// so unit tests can cover them without linking the terminal UI.
 
 #include <cstdint>
 #include <string>
