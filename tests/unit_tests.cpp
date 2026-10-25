@@ -4,6 +4,7 @@
 #include "mtrxai/pipeline.hpp"
 #include "mtrxai/provider.hpp"
 #include "mtrxai/signals.hpp"
+#include "mtrxai/stream_parse.hpp"
 #include "mtrxai/utf8.hpp"
 
 TEST_CASE("llama_log_path uses state home and role") {
@@ -177,4 +178,57 @@ TEST_CASE("utf8 cursor helpers step over multibyte characters") {
   // Continuation bytes are never reported as character starts.
   CHECK(mtrxai::utf8_is_continuation(text[2]));
   CHECK_FALSE(mtrxai::utf8_is_continuation(text[1]));
+}
+
+TEST_CASE("stream parsers decode SSE payloads") {
+  CHECK(mtrxai::stream::sse_payload("data: {\"x\":1}") == "{\"x\":1}");
+  CHECK(mtrxai::stream::sse_payload("data: [DONE]") == "[DONE]");
+  CHECK(mtrxai::stream::sse_payload("data:") == "");
+  CHECK(mtrxai::stream::sse_payload(": keepalive") == "");
+  CHECK(mtrxai::stream::sse_payload("event: content_block_delta") == "");
+}
+
+TEST_CASE("stream parsers report embedded errors") {
+  CHECK(mtrxai::stream::error_message("{\"error\":\"boom\"}") == "boom");
+  CHECK(mtrxai::stream::error_message(
+            "{\"error\":{\"message\":\"quota\"}}") == "quota");
+  CHECK(mtrxai::stream::error_message(
+            "{\"type\":\"error\",\"error\":{\"message\":\"overloaded\"}}") ==
+        "overloaded");
+  CHECK(mtrxai::stream::error_message("{\"message\":\"fine\"}") == "");
+}
+
+TEST_CASE("Ollama NDJSON line yields message content") {
+  const std::string line =
+      "{\"model\":\"m\",\"message\":{\"role\":\"assistant\","
+      "\"content\":\"hel\"},\"done\":false}";
+  CHECK(mtrxai::stream::ollama_delta_text(line) == "hel");
+  // Final stats line has no text.
+  CHECK(mtrxai::stream::ollama_delta_text(
+            "{\"done\":true,\"message\":{\"content\":\"\"}}") == "");
+  CHECK(mtrxai::stream::ollama_delta_text("not json") == "");
+}
+
+TEST_CASE("OpenAI delta parser extracts choices[0].delta.content") {
+  const std::string chunk =
+      "{\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}";
+  CHECK(mtrxai::stream::openai_delta_text(chunk) == "lo");
+  // Finish chunk without content.
+  CHECK(mtrxai::stream::openai_delta_text(
+            "{\"choices\":[{\"delta\":{},"
+            "\"finish_reason\":\"stop\"}]}") == "");
+  // Usage-only chunk without choices.
+  CHECK(mtrxai::stream::openai_delta_text(
+            "{\"usage\":{\"total_tokens\":12}}") == "");
+}
+
+TEST_CASE("Anthropic delta parser reads text_delta events") {
+  CHECK(mtrxai::stream::anthropic_delta_text(
+            "{\"type\":\"content_block_delta\","
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}") == "hi");
+  CHECK(mtrxai::stream::anthropic_delta_text(
+            "{\"type\":\"message_start\",\"message\":{}}") == "");
+  CHECK(mtrxai::stream::anthropic_delta_text(
+            "{\"type\":\"content_block_delta\","
+            "\"delta\":{\"type\":\"input_json_delta\"}}") == "");
 }

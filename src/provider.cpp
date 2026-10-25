@@ -1,10 +1,12 @@
 #include "mtrxai/provider.hpp"
 #include "mtrxai/signals.hpp"
+#include "mtrxai/stream_parse.hpp"
 
 #include <curl/curl.h>
 #include <json-c/json.h>
 
 #include <algorithm>
+#include <atomic>
 #include <arpa/inet.h>
 #include <csignal>
 #include <cstdlib>
@@ -44,6 +46,8 @@ std::filesystem::path llama_log_path(const std::string& role) {
 
 namespace {
 
+using TokenSink = InferenceSession::TokenSink;
+
 struct JsonDeleter {
   void operator()(json_object* value) const {
     if (value != nullptr) json_object_put(value);
@@ -73,6 +77,103 @@ std::size_t append_body(char* data, std::size_t size, std::size_t count,
 
 std::size_t discard_body(char*, std::size_t size, std::size_t count, void*) {
   return size * count;
+}
+
+// Feeds every complete line of a streaming response to the handler. Both SSE
+// and Ollama NDJSON are newline-delimited, so one callback covers all
+// protocols. Stored errors are rethrown after the transfer finishes because
+// exceptions must not escape a curl callback.
+struct StreamContext {
+  std::string pending;
+  std::function<void(const std::string&)> on_line;
+  std::atomic<bool>* cancelled = nullptr;
+  std::exception_ptr error;
+
+  void run_line(const std::string& line) {
+    if (error) return;
+    try {
+      on_line(line);
+    } catch (...) {
+      error = std::current_exception();
+    }
+  }
+};
+
+std::size_t stream_lines(char* data, std::size_t size, std::size_t count,
+                         void* destination) {
+  auto& context = *static_cast<StreamContext*>(destination);
+  if (context.cancelled != nullptr &&
+      context.cancelled->load(std::memory_order_relaxed)) {
+    return 0;  // aborts the transfer with CURLE_WRITE_ERROR
+  }
+  const std::size_t bytes = size * count;
+  constexpr std::size_t max_buffer = 4 * 1024 * 1024;
+  if (bytes > max_buffer - context.pending.size()) {
+    context.error = std::make_exception_ptr(
+        std::runtime_error("Streaming response exceeded the 4 MiB safety limit"));
+    return 0;
+  }
+  context.pending.append(data, bytes);
+  std::size_t newline = context.pending.find('\n');
+  while (newline != std::string::npos && !context.error) {
+    std::string line = context.pending.substr(0, newline);
+    context.pending.erase(0, newline + 1);
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    context.run_line(line);
+    newline = context.pending.find('\n');
+  }
+  return bytes;
+}
+
+// Like post_json but line-oriented; used for every generation request.
+void post_json_lines(
+    const std::string& url, const std::string& body,
+    const std::function<void(const std::string&)>& on_line,
+    const std::string& api_key = "",
+    const std::vector<std::string>& extra_headers = {},
+    std::atomic<bool>* cancelled = nullptr) {
+  CURL* curl = curl_easy_init();
+  if (curl == nullptr) throw std::runtime_error("Could not create HTTP request");
+  StreamContext context;
+  context.on_line = on_line;
+  context.cancelled = cancelled;
+  long status = 0;
+  struct curl_slist* headers = nullptr;
+  headers = curl_slist_append(headers, "Content-Type: application/json");
+  const std::string authorization = "Authorization: Bearer " + api_key;
+  if (!api_key.empty()) headers = curl_slist_append(headers, authorization.c_str());
+  for (const auto& header : extra_headers) {
+    headers = curl_slist_append(headers, header.c_str());
+  }
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stream_lines);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3600);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+  const CURLcode result = curl_easy_perform(curl);
+  // The final line may lack a trailing newline.
+  if (!context.pending.empty() && !context.error) {
+    std::string line = context.pending;
+    if (line.back() == '\r') line.pop_back();
+    context.run_line(line);
+  }
+  if (result == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+  if (context.error) std::rethrow_exception(context.error);
+  if (result == CURLE_WRITE_ERROR) {
+    throw Cancelled();  // the write callback aborted it
+  }
+  if (result != CURLE_OK) {
+    throw std::runtime_error(std::string("Model request failed: ") +
+                             curl_easy_strerror(result));
+  }
+  if (status < 200 || status >= 300) {
+    throw std::runtime_error("Model server returned HTTP " +
+                             std::to_string(status) + " during streaming");
+  }
 }
 
 HttpResponse post_json(const std::string& url, const std::string& body,
@@ -115,15 +216,6 @@ HttpResponse post_json(const std::string& url, const std::string& body,
   return response;
 }
 
-std::string json_string(json_object* object, const char* key) {
-  json_object* value = nullptr;
-  if (!json_object_object_get_ex(object, key, &value) ||
-      !json_object_is_type(value, json_type_string)) {
-    throw std::runtime_error(std::string("Model response is missing ") + key);
-  }
-  return json_object_get_string(value);
-}
-
 std::string messages_json(const Messages& messages) {
   Json array(json_object_new_array());
   for (const auto& [role, content] : messages) {
@@ -143,13 +235,15 @@ std::string normalize_url(std::string url) {
 }
 
 std::string ollama_generate(const ModelSlot& slot, const Messages& messages,
-                            const std::string& base_url) {
+                            const std::string& base_url,
+                            const TokenSink& on_token,
+                            std::atomic<bool>* cancelled) {
   Json body(json_object_new_object());
   json_object_object_add(body.get(), "model",
                          json_object_new_string(slot.model.c_str()));
   Json parsed_messages(json_tokener_parse(messages_json(messages).c_str()));
   json_object_object_add(body.get(), "messages", parsed_messages.release());
-  json_object_object_add(body.get(), "stream", json_object_new_boolean(false));
+  json_object_object_add(body.get(), "stream", json_object_new_boolean(true));
   json_object_object_add(body.get(), "keep_alive",
                          json_object_new_string("30s"));
   Json options(json_object_new_object());
@@ -160,63 +254,84 @@ std::string ollama_generate(const ModelSlot& slot, const Messages& messages,
                            json_object_new_int(slot.max_tokens));
   }
   json_object_object_add(body.get(), "options", options.release());
-  const auto response =
-      post_json(base_url + "/api/chat",
-                json_object_to_json_string_ext(body.get(), JSON_C_TO_STRING_PLAIN));
-  Json root(json_tokener_parse(response.body.c_str()));
-  if (!root || !json_object_is_type(root.get(), json_type_object)) {
-    throw std::runtime_error("Ollama returned invalid JSON");
+  std::string content;
+  post_json_lines(
+      base_url + "/api/chat",
+      json_object_to_json_string_ext(body.get(), JSON_C_TO_STRING_PLAIN),
+      [&](const std::string& line) {
+        if (line.empty()) return;
+        const std::string payload_error = stream::error_message(line);
+        if (!payload_error.empty() && content.empty()) {
+          throw std::runtime_error("Ollama stream reported an error: " +
+                                   payload_error);
+        }
+        const std::string delta = stream::ollama_delta_text(line);
+        if (delta.empty()) return;
+        content += delta;
+        if (on_token) on_token(delta);
+      },
+      "", {}, cancelled);
+  if (content.empty()) {
+    throw std::runtime_error("Ollama stream produced no content");
   }
-  json_object* message = nullptr;
-  if (!json_object_object_get_ex(root.get(), "message", &message) ||
-      !json_object_is_type(message, json_type_object)) {
-    throw std::runtime_error("Ollama response is missing message");
-  }
-  return json_string(message, "content");
+  return content;
 }
 
 std::string openai_generate(const ModelSlot& slot, const Messages& messages,
                             const std::string& base_url,
-                            const std::string& api_key) {
+                            const std::string& api_key,
+                            const TokenSink& on_token,
+                            std::atomic<bool>* cancelled) {
   Json body(json_object_new_object());
   json_object_object_add(body.get(), "model",
                          json_object_new_string(slot.model.c_str()));
   Json parsed_messages(json_tokener_parse(messages_json(messages).c_str()));
   json_object_object_add(body.get(), "messages", parsed_messages.release());
-  json_object_object_add(body.get(), "stream", json_object_new_boolean(false));
+  json_object_object_add(body.get(), "stream", json_object_new_boolean(true));
   if (slot.max_tokens > 0) {
     json_object_object_add(body.get(), "max_tokens",
                            json_object_new_int(slot.max_tokens));
   }
-  const auto response =
-      post_json(base_url + "/chat/completions",
-                json_object_to_json_string_ext(body.get(), JSON_C_TO_STRING_PLAIN),
-                api_key);
-  Json root(json_tokener_parse(response.body.c_str()));
-  if (!root || !json_object_is_type(root.get(), json_type_object)) {
-    throw std::runtime_error("OpenAI-compatible endpoint returned invalid JSON");
+  std::string content;
+  post_json_lines(
+      base_url + "/chat/completions",
+      json_object_to_json_string_ext(body.get(), JSON_C_TO_STRING_PLAIN),
+      [&](const std::string& line) {
+        const std::string payload = stream::sse_payload(line);
+        if (payload.empty() || payload == "[DONE]") return;
+        if (stream::error_message(payload).empty()) {
+          const std::string delta = stream::openai_delta_text(payload);
+          if (!delta.empty()) {
+            content += delta;
+            if (on_token) on_token(delta);
+          }
+          return;
+        }
+        // Some endpoints only flag errors in the first chunks; report the
+        // accumulated content if any arrives before the error.
+        if (content.empty()) {
+          throw std::runtime_error("Endpoint stream reported an error: " +
+                                   stream::error_message(payload));
+        }
+      },
+      api_key, {}, cancelled);
+  if (content.empty()) {
+    throw std::runtime_error("Endpoint stream produced no content");
   }
-  json_object* choices = nullptr;
-  json_object* choice = nullptr;
-  json_object* message = nullptr;
-  if (!json_object_object_get_ex(root.get(), "choices", &choices) ||
-      !json_object_is_type(choices, json_type_array) ||
-      json_object_array_length(choices) == 0 ||
-      (choice = json_object_array_get_idx(choices, 0)) == nullptr ||
-      !json_object_object_get_ex(choice, "message", &message)) {
-    throw std::runtime_error("OpenAI-compatible response is missing choices[0].message");
-  }
-  return json_string(message, "content");
+  return content;
 }
 
 std::string anthropic_generate(const ModelSlot& slot, const Messages& messages,
                                const std::string& base_url,
-                               const std::string& api_key) {
+                               const std::string& api_key,
+                               const TokenSink& on_token,
+                               std::atomic<bool>* cancelled) {
   Json body(json_object_new_object());
   json_object_object_add(body.get(), "model",
                          json_object_new_string(slot.model.c_str()));
   json_object_object_add(body.get(), "max_tokens",
                          json_object_new_int(slot.max_tokens > 0 ? slot.max_tokens : 4096));
+  json_object_object_add(body.get(), "stream", json_object_new_boolean(true));
   Json request_messages(json_object_new_array());
   std::string system_prompt;
   for (const auto& [role, content] : messages) {
@@ -243,25 +358,27 @@ std::string anthropic_generate(const ModelSlot& slot, const Messages& messages,
   if (endpoint.size() < 3 || endpoint.substr(endpoint.size() - 3) != "/v1") {
     endpoint += "/v1";
   }
-  const auto response = post_json(
+  std::string content;
+  post_json_lines(
       endpoint + "/messages",
-      json_object_to_json_string_ext(body.get(), JSON_C_TO_STRING_PLAIN), "",
-      3600, headers);
-  Json root(json_tokener_parse(response.body.c_str()));
-  if (!root || !json_object_is_type(root.get(), json_type_object)) {
-    throw std::runtime_error("Anthropic returned invalid JSON");
+      json_object_to_json_string_ext(body.get(), JSON_C_TO_STRING_PLAIN),
+      [&](const std::string& line) {
+        const std::string payload = stream::sse_payload(line);
+        if (payload.empty()) return;
+        if (!stream::error_message(payload).empty() && content.empty()) {
+          throw std::runtime_error("Anthropic stream reported an error: " +
+                                   stream::error_message(payload));
+        }
+        const std::string delta = stream::anthropic_delta_text(payload);
+        if (delta.empty()) return;
+        content += delta;
+        if (on_token) on_token(delta);
+      },
+      "", headers, cancelled);
+  if (content.empty()) {
+    throw std::runtime_error("Anthropic stream produced no content");
   }
-  json_object* content = nullptr;
-  if (!json_object_object_get_ex(root.get(), "content", &content) ||
-      !json_object_is_type(content, json_type_array)) {
-    throw std::runtime_error("Anthropic response is missing content");
-  }
-  for (std::size_t i = 0; i < json_object_array_length(content); ++i) {
-    json_object* block = json_object_array_get_idx(content, i);
-    if (block == nullptr || !json_object_is_type(block, json_type_object)) continue;
-    if (json_string(block, "type") == "text") return json_string(block, "text");
-  }
-  throw std::runtime_error("Anthropic response contains no text content");
+  return content;
 }
 
 unsigned short available_port() {
@@ -407,6 +524,7 @@ struct InferenceSession::Impl {
   std::string api_key;
   std::unique_ptr<LlamaServer> llama_server;
   bool released = false;
+  std::atomic<bool> cancelled{false};
 
   Impl(const ModelSlot& model, const Status& update)
       : slot(model), status(update), base_url(normalize_url(model.base_url)) {
@@ -468,17 +586,35 @@ InferenceSession::~InferenceSession() noexcept {
 }
 
 std::string InferenceSession::generate(const Messages& messages) {
+  return generate(messages, TokenSink());
+}
+
+std::string InferenceSession::generate(const Messages& messages,
+                                       const TokenSink& on_token) {
   if (impl_->released) {
     throw std::runtime_error("Cannot generate after the model stage is unloaded.");
   }
+  if (impl_->cancelled.load(std::memory_order_relaxed)) {
+    throw Cancelled();
+  }
   if (impl_->slot.provider == "ollama") {
-    return ollama_generate(impl_->slot, messages, impl_->base_url);
+    return ollama_generate(impl_->slot, messages, impl_->base_url, on_token,
+                           &impl_->cancelled);
   }
   if (impl_->slot.provider == "anthropic") {
     return anthropic_generate(impl_->slot, messages, impl_->base_url,
-                              impl_->api_key);
+                              impl_->api_key, on_token, &impl_->cancelled);
   }
-  return openai_generate(impl_->slot, messages, impl_->endpoint, impl_->api_key);
+  return openai_generate(impl_->slot, messages, impl_->endpoint, impl_->api_key,
+                         on_token, &impl_->cancelled);
+}
+
+void InferenceSession::request_cancel() {
+  if (impl_) impl_->cancelled.store(true, std::memory_order_relaxed);
+}
+
+void InferenceSession::clear_cancel() {
+  if (impl_) impl_->cancelled.store(false, std::memory_order_relaxed);
 }
 
 void InferenceSession::release() {

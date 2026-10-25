@@ -162,7 +162,10 @@ up in the private session folder. Generated commands are not run automatically.
 mtrxAI saves the Chief and Prompter handoffs and each Coder turn before moving
 on. The Coder gets a bounded project-file listing and inspects relevant source
 on demand. Each model role configures `max_tokens` (`num_predict` in Ollama).
-Model `<think>...</think>` blocks are stripped before passing outputs to downstream
+Generation requests stream: Ollama uses its native NDJSON stream while
+OpenAI-compatible endpoints and Anthropic use SSE, so replies arrive as
+incremental chunks and a request can be aborted mid-stream instead of waiting
+for one blocking response. Model `<think>...</think>` blocks are stripped before passing outputs to downstream
 roles to prevent context pollution, and reasoning is saved in separate session
 artifacts (`chief_thinking.md`, `prompt_thinking.md`, `coder_turn_<N>_thinking.md`).
 When running local GGUF models, `llama-server` stdout and stderr are

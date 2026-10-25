@@ -296,17 +296,38 @@ def run(binary):
                 return
             answer = actions[len(chat_requests)]
             chat_requests.append(body)
+            if self.path == "/api/generate" or not body.get("stream"):
+                raise AssertionError(f"expected a streaming request to {self.path}")
             if self.path == "/v1/messages":
-                response = json.dumps(
-                    {"content": [{"type": "text", "text": answer}]}
-                ).encode()
-            else:
-                response = json.dumps({"message": {"content": answer}}).encode()
+                # Anthropic streaming: emit the answer as text_delta events.
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                for index in range(0, len(answer), 7):
+                    chunk = answer[index:index + 7]
+                    event = json.dumps(
+                        {"type": "content_block_delta",
+                         "delta": {"type": "text_delta", "text": chunk}})
+                    self.wfile.write(f"data: {event}\n\n".encode())
+                    self.wfile.flush()
+                self.wfile.write(b"data: {\"type\":\"message_stop\"}\n\n")
+                self.wfile.flush()
+                return
+            # Ollama native chat streaming: one JSON object per line.
             self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(response)))
+            self.send_header("Content-Type", "application/x-ndjson")
             self.end_headers()
-            self.wfile.write(response)
+            for index in range(0, len(answer), 9):
+                chunk = answer[index:index + 9]
+                event = json.dumps(
+                    {"model": "prompter-test",
+                     "message": {"role": "assistant", "content": chunk},
+                     "done": False})
+                self.wfile.write(event.encode() + b"\n")
+                self.wfile.flush()
+            event = json.dumps({"model": "prompter-test", "done": True})
+            self.wfile.write(event.encode() + b"\n")
+            self.wfile.flush()
 
         def log_message(self, *_args):
             pass
@@ -447,6 +468,10 @@ def run(binary):
         assert requests[1]["body"]["keep_alive"] == "30s"
         assert requests[1]["body"]["options"]["num_predict"] == 4096
         assert requests[2]["body"]["keep_alive"] == 0
+        # Every generation request asks for streaming; the unload does not.
+        assert requests[0]["body"]["stream"] is True
+        assert requests[1]["body"]["stream"] is True
+        assert all(entry["body"]["stream"] is True for entry in generated_requests)
         assert "Chief thinking process" not in json.dumps(requests[1]["body"]["messages"])
         assert "<think>" not in json.dumps(requests[1]["body"]["messages"])
         assert generated_requests[0]["body"]["max_tokens"] == 4096
