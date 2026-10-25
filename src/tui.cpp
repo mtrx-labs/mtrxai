@@ -41,6 +41,27 @@ namespace {
 constexpr int kSidebarWidth = 25;
 constexpr std::size_t kClipboardLimit = 64 * 1024;
 
+class EnhancedKeyboardMode {
+ public:
+  EnhancedKeyboardMode() {
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) return;
+    static constexpr char enable[] = "\033[>1u";
+    if (write(STDOUT_FILENO, enable, sizeof(enable) - 1) ==
+        static_cast<ssize_t>(sizeof(enable) - 1)) {
+      enabled_ = true;
+    }
+  }
+
+  ~EnhancedKeyboardMode() {
+    if (!enabled_) return;
+    static constexpr char restore[] = "\033[<u";
+    (void)write(STDOUT_FILENO, restore, sizeof(restore) - 1);
+  }
+
+ private:
+  bool enabled_ = false;
+};
+
 std::string base64_encode(const std::string& value) {
   static constexpr char alphabet[] =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -235,6 +256,7 @@ std::string help_report() {
          "  /gguftimeout SECONDS            set GGUF server load timeout (1-3600)\n"
          "After a run, Enter resumes saved work or starts a same-session follow-up;\n"
          "Ctrl+N starts a fresh task.\n"
+         "Shift+Enter inserts a new line in the prompt.\n"
          "Drag across conversation text to copy it; terminal OSC 52 support is required.\n"
          "PgUp/PgDn scrolls the conversation.\n"
          "Use Up/Down or PgUp/PgDn to review every proposed file or shell command.\n"
@@ -477,6 +499,9 @@ class Ui {
 
   void run(const std::filesystem::path& resume_session) {
     if (!resume_session.empty()) start_resume(resume_session);
+    // Kitty keyboard mode lets terminals distinguish Shift+Enter from Enter.
+    // Restore the terminal's previous mode when the UI exits.
+    EnhancedKeyboardMode enhanced_keyboard;
     auto root = ftxui::CatchEvent(
         ftxui::Renderer([this] { return render(); }),
         [this](ftxui::Event event) { return on_event(std::move(event)); });
@@ -563,7 +588,8 @@ class Ui {
       return with_scroll(
           "Enter follow-up   Ctrl+N new task   /help commands   /quit exit");
     }
-    return with_scroll("Enter to send   /help commands   /quit exit");
+    return with_scroll(
+        "Enter to send   Shift+Enter new line   /help commands   /quit exit");
   }
 
   ftxui::Element render_sidebar() const {
@@ -621,10 +647,14 @@ class Ui {
 
   ftxui::Element render_input_panel() const {
     using namespace ftxui;
+    const std::size_t lines =
+        1 + static_cast<std::size_t>(
+                std::count(input_.begin(), input_.end(), '\n'));
     return window(text("MESSAGE") | bold | color(Color::Green),
                   hbox({text("> ") | color(Color::GrayDark),
                         render_input_text()})) |
-           size(HEIGHT, EQUAL, 3);
+           size(HEIGHT, EQUAL,
+                static_cast<int>(std::max<std::size_t>(3, lines + 2)));
   }
 
   bool command_palette_active() const {
@@ -1265,6 +1295,15 @@ class Ui {
     }
     if (follow_up_mode_ && event == Event::CtrlN) {
       finish_worker();
+      return true;
+    }
+    if (event.input() == "\033[13;2u" ||
+        event.input() == "\033[13;2:1u") {
+      if (input_.size() < 8191) {
+        input_.insert(cursor_, 1, '\n');
+        ++cursor_;
+        command_selection_ = 0;
+      }
       return true;
     }
     if (event == Event::Return) {
