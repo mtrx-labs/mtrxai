@@ -307,6 +307,32 @@ CoderAction parse_action(const std::string& output) {
   return action;
 }
 
+bool supported_action(const std::string& name) {
+  return name == "list_files" || name == "read_file" ||
+         name == "write_file" || name == "run_command" || name == "finish";
+}
+
+// An empty result means the reply is a usable action. Otherwise the text is a
+// short reason that can be shown to the user and sent back to the model.
+std::string action_rejection(const std::string& output) {
+  try {
+    const CoderAction action = parse_action(output);
+    if (!supported_action(action.name)) {
+      return "Unsupported coder action: " + action.name;
+    }
+    return {};
+  } catch (const std::exception& error) {
+    return error.what();
+  }
+}
+
+std::string rejection_correction(const std::string& rejection) {
+  return "Your previous reply was rejected: " + rejection +
+         "\n\nReply with exactly one JSON object and nothing else. Use only "
+         "the supported actions from the system prompt, with no markdown "
+         "fences or extra text.";
+}
+
 std::filesystem::path checked_target(const std::filesystem::path& root,
                                      const std::filesystem::path& relative) {
   if (relative.empty() || relative.is_absolute()) {
@@ -613,6 +639,37 @@ void move_aside(const std::filesystem::path& path) {
   }
 }
 
+// Keeps a reply that the model should not have sent. The transcript records
+// only usable actions, so the archive is the only copy of the raw reply (the
+// processing stream is also moved aside). It stays readable for debugging.
+std::filesystem::path archive_rejected_reply(
+    const std::filesystem::path& session, int turn,
+    const std::string& rejection, const std::string& content,
+    const std::string& thinking) {
+  const auto directory = session / "coder" / "rejected";
+  std::error_code error;
+  std::filesystem::create_directories(directory, error);
+  if (error) {
+    throw std::runtime_error("Could not create rejected reply directory: " +
+                             error.message());
+  }
+  const std::string label =
+      rejection.rfind("Unsupported coder action:", 0) == 0 ? "unsupported"
+                                                           : "malformed";
+  const auto path = directory / ("turn-" + std::to_string(turn) + "-" + label +
+                                 "-" + timestamp() + ".md");
+  std::ostringstream archive;
+  archive << "# Rejected Coder reply\n\n"
+          << "Turn: " << turn << "\n"
+          << "Reason: " << rejection << "\n\n";
+  if (!thinking.empty()) {
+    archive << "## Thinking\n\n" << thinking << "\n\n";
+  }
+  archive << "## Reply\n\n" << content << "\n";
+  write_atomic(path, archive.str());
+  return path;
+}
+
 // Stages only move forward. A manifest from an older version may be missing,
 // so an unknown stage ranks below "request" and the run starts over.
 int stage_rank(const std::string& stage) {
@@ -863,7 +920,7 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
   // finish just completes the session without loading a model at all.
   bool pending_assistant =
       reuse_transcript && saved_messages.back().role == "assistant";
-  const int assistant_count = static_cast<int>(std::count_if(
+  int assistant_count = static_cast<int>(std::count_if(
       saved_messages.begin(), saved_messages.end(),
       [](const CoderMessage& message) {
         return message.role == "assistant";
@@ -877,6 +934,44 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
     response_turn = saved_messages.back().turn > 0
                         ? saved_messages.back().turn
                         : std::max(1, assistant_count);
+  }
+
+  // A transcript written before parse-before-persist could end with a reply
+  // that was never usable. Resume must not ask the user to approve it. Archive
+  // the reply, replace it with a correction, and rewrite the transcript before
+  // any model call. The discarded reply counts as this turn's one retry, so a
+  // fresh bad reply aborts immediately instead of allowing two more.
+  int rejected_attempts = 0;
+  std::string recovered_log;
+  if (pending_assistant) {
+    const std::string rejection = action_rejection(response_content);
+    if (!rejection.empty()) {
+      const auto archived = archive_rejected_reply(
+          session, response_turn, rejection, response_content,
+          saved_messages.back().thinking);
+      rejected_attempts = 1;
+      saved_messages.pop_back();
+      --assistant_count;
+      pending_assistant = false;
+      const std::string correction = rejection_correction(rejection);
+      CoderMessage correction_message;
+      correction_message.role = "user";
+      correction_message.content = correction;
+      correction_message.turn = response_turn;
+      saved_messages.push_back(correction_message);
+      // Rewrite the whole file atomically: a crash during this repair must not
+      // bring the discarded reply back on the next resume.
+      CoderTranscript::save(coder_transcript_path, saved_messages);
+      recovered_log = "## Recovered\n\nThe saved reply for turn " +
+                      std::to_string(response_turn) + " was rejected: " +
+                      rejection + "\n\nIt was saved at coder/rejected/" +
+                      archived.filename().string() +
+                      " and replaced with a correction.\n\n";
+      status("Coder: saved reply for turn " + std::to_string(response_turn) +
+             " was not a valid action; discarded it and will ask again.");
+      response_content.clear();
+      response_turn = 0;
+    }
   }
 
   CoderTranscript transcript(coder_transcript_path);
@@ -901,6 +996,7 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
     if (coder_log.empty()) coder_log = "# Coder session\n\n";
     // Keep the human-readable log continuous, and make the resume visible.
     coder_log += "\n## Resumed\n\n";
+    if (!recovered_log.empty()) coder_log += recovered_log;
     write_atomic(session / "coder.md", coder_log);
     status("Coder: loaded " + std::to_string(saved_messages.size()) +
            " saved messages; continuing at turn " +
@@ -1052,8 +1148,45 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
       response_content = response.content;
       response_turn = next_turn;
 
-      // This append is the commit point. If the process dies after it, resume
-      // knows the reply exists and will not ask the model for it again.
+      // Validate before saving. The transcript is what resume trusts, so a
+      // reply that cannot be acted on must never enter it; the archive keeps
+      // the original text (and any reasoning) for inspection.
+      const std::string rejection = action_rejection(response_content);
+      if (!rejection.empty()) {
+        const auto archived = archive_rejected_reply(
+            session, response_turn, rejection, response.content,
+            response.thinking);
+        ++rejected_attempts;
+        // The raw log holds this reply under the current turn. Close it before
+        // moving it aside so the retry starts a new stream; read_raw_text would
+        // otherwise concatenate both replies.
+        coder_recorder.reset();
+        move_aside(coder_raw_path);
+        if (rejected_attempts >= 2) {
+          throw std::runtime_error(
+              "Coder produced two replies that were not valid actions for "
+              "turn " + std::to_string(response_turn) +
+              ". The rejected replies are saved in " +
+              (session / "coder" / "rejected").string() + ".");
+        }
+        const std::string correction = rejection_correction(rejection);
+        persist_message("user", correction, "", response_turn);
+        coder_messages.emplace_back("user", correction);
+        coder_log += "## Turn " + std::to_string(response_turn) +
+                     " (rejected reply)\n\n";
+        coder_log += "### Rejected Coder reply\n\n" + rejection +
+                     "\n\nThe reply was saved at coder/rejected/" +
+                     archived.filename().string() + ".\n\n";
+        coder_log += "### Correction\n\n" + correction + "\n\n";
+        write_atomic(session / "coder.md", coder_log);
+        status("Coder: turn " + std::to_string(response_turn) +
+               " reply rejected (" + rejection + "); asking once more.");
+        continue;
+      }
+
+      // The reply is a usable action. This append is the commit point. If the
+      // process dies after it, resume knows the reply exists and will not ask
+      // the model for it again.
       persist_message("assistant", response.content, response.thinking,
                       response_turn);
       coder_messages.emplace_back("assistant", response.content);
@@ -1070,6 +1203,7 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
                                  std::to_string(response_turn));
       pending_assistant = true;
       ++next_turn;
+      rejected_attempts = 0;
     }
 
     // A fresh reply and one loaded from disk take exactly the same path from

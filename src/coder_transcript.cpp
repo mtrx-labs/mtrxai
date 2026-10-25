@@ -1,5 +1,7 @@
 #include "mtrxai/coder_transcript.hpp"
 
+#include "mtrxai/files.hpp"
+
 #include <json-c/json.h>
 
 #include <cerrno>
@@ -26,6 +28,27 @@ bool valid_role(const std::string& role) {
   return role == "system" || role == "user" || role == "assistant";
 }
 
+// One JSON object plus the newline that makes it a JSONL record. Both append
+// and save use this so a rewritten transcript has exactly the same schema.
+std::string encode_message(const CoderMessage& message) {
+  Json record(json_object_new_object());
+  json_object_object_add(record.get(), "role",
+                         json_object_new_string(message.role.c_str()));
+  json_object_object_add(record.get(), "content",
+                         json_object_new_string(message.content.c_str()));
+  if (!message.thinking.empty()) {
+    json_object_object_add(record.get(), "thinking",
+                           json_object_new_string(message.thinking.c_str()));
+  }
+  if (message.turn > 0) {
+    json_object_object_add(record.get(), "turn",
+                           json_object_new_int(message.turn));
+  }
+  return std::string(json_object_to_json_string_ext(
+                         record.get(), JSON_C_TO_STRING_PLAIN)) +
+         "\n";
+}
+
 }  // namespace
 
 CoderTranscript::CoderTranscript(const std::filesystem::path& path)
@@ -48,23 +71,7 @@ CoderTranscript::~CoderTranscript() {
 }
 
 void CoderTranscript::append(const CoderMessage& message) {
-  Json record(json_object_new_object());
-  json_object_object_add(record.get(), "role",
-                         json_object_new_string(message.role.c_str()));
-  json_object_object_add(record.get(), "content",
-                         json_object_new_string(message.content.c_str()));
-  if (!message.thinking.empty()) {
-    json_object_object_add(record.get(), "thinking",
-                           json_object_new_string(message.thinking.c_str()));
-  }
-  if (message.turn > 0) {
-    json_object_object_add(record.get(), "turn",
-                           json_object_new_int(message.turn));
-  }
-  const std::string line =
-      std::string(json_object_to_json_string_ext(record.get(),
-                                                 JSON_C_TO_STRING_PLAIN)) +
-      "\n";
+  const std::string line = encode_message(message);
   std::size_t written = 0;
   while (written < line.size()) {
     const ssize_t count =
@@ -82,6 +89,22 @@ void CoderTranscript::append(const CoderMessage& message) {
     throw std::runtime_error("Could not flush Coder transcript " +
                              path_.string() + ": " + std::strerror(errno));
   }
+}
+
+void CoderTranscript::save(const std::filesystem::path& path,
+                           const std::vector<CoderMessage>& messages) {
+  std::error_code error;
+  std::filesystem::create_directories(path.parent_path(), error);
+  if (error) {
+    throw std::runtime_error("Could not create Coder transcript directory: " +
+                             error.message());
+  }
+  std::string content;
+  for (const auto& message : messages) content += encode_message(message);
+  // write_atomic fsyncs the temporary file and its directory before the
+  // rename, so an interrupted repair either keeps the old transcript or
+  // leaves the complete new one.
+  write_atomic(path, content);
 }
 
 std::vector<CoderMessage> CoderTranscript::load(

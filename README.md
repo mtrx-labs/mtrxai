@@ -165,12 +165,16 @@ on. Every stage additionally records its streamed tokens verbatim in
 `<session>/<stage>/raw.jsonl` (owner-only, flushed as chunks arrive, fsynced
 about once a second); the derived stage files such as `chief.md` are written
 afterwards from that recording, so a killed run still leaves enough state to
-rebuild the stage. The Coder also writes an append-only transcript at
+rebuild the stage. The Coder also writes a transcript at
 `<session>/coder/messages.jsonl`: one owner-only, fsynced JSON line per message
 in the Coder context, including the exact tool-result text; assistant reasoning
 is stored separately. The manifest tracks progress, but the transcript is what
 resume trusts for the Coder, because a process can die between a model reply
-and the action it requested. The Coder gets a bounded project-file listing and inspects
+and the action it requested. A reply that is not a usable action is never
+written into the transcript: it is saved with any reasoning under
+`<session>/coder/rejected/`, the Coder receives one persisted correction, and it
+gets one more try for that turn. A second unusable reply stops the run; the
+session stays resumable. The Coder gets a bounded project-file listing and inspects
 relevant source on demand. Each model role configures `max_tokens` (`num_predict` in Ollama).
 Generation requests stream: Ollama uses its native NDJSON stream while
 OpenAI-compatible endpoints and Anthropic use SSE, so replies arrive as
@@ -206,8 +210,11 @@ run from a different directory. The Coder conversation is rebuilt from
 Coder waits for approval does not repeat the model call. If the last saved reply
 requested an action that had not run yet, resume shows it for approval again;
 file writes and commands are never replayed automatically. A saved `finish`
-action completes the session without loading a model. Sessions written before
-transcripts existed keep their old Coder attempt as
+action completes the session without loading a model. Replies that were not
+usable actions are kept under `coder/rejected/` and are never shown for
+approval. If a transcript from an older version ends with such a saved reply,
+resume archives it, replaces it with a correction, and regenerates that turn.
+Sessions written before transcripts existed keep their old Coder attempt as
 `coder.before-resume-<timestamp>` and start the Coder again. A session whose
 manifest says `finished` is reported as complete without starting any model.
 

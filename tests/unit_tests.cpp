@@ -357,6 +357,65 @@ TEST_CASE("CoderTranscript round-trips every message it appends") {
   std::filesystem::remove_all(root);
 }
 
+TEST_CASE("CoderTranscript::save replaces the conversation atomically") {
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("mtrxai_transcript_save_test_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(root);
+  const auto path = root / "coder" / "messages.jsonl";
+
+  mtrxai::CoderMessage system;
+  system.role = "system";
+  system.content = "system prompt";
+  mtrxai::CoderMessage initial;
+  initial.role = "user";
+  initial.content = "initial request";
+  mtrxai::CoderMessage bad;
+  bad.role = "assistant";
+  bad.content = "not an action";
+  bad.thinking = "why it failed";
+  bad.turn = 1;
+  {
+    mtrxai::CoderTranscript transcript(path);
+    transcript.append(system);
+    transcript.append(initial);
+    transcript.append(bad);
+  }
+
+  auto repaired = mtrxai::CoderTranscript::load(path);
+  REQUIRE(repaired.size() == 3);
+  repaired.pop_back();
+  mtrxai::CoderMessage correction;
+  correction.role = "user";
+  correction.content = "Your previous reply was rejected.";
+  correction.turn = 1;
+  repaired.push_back(correction);
+  mtrxai::CoderTranscript::save(path, repaired);
+
+  const auto saved = mtrxai::CoderTranscript::load(path);
+  REQUIRE(saved.size() == 3);
+  CHECK(saved[0].role == "system");
+  CHECK(saved[0].content == "system prompt");
+  CHECK(saved[1].role == "user");
+  CHECK(saved[1].content == "initial request");
+  CHECK(saved[2].role == "user");
+  CHECK(saved[2].content == "Your previous reply was rejected.");
+  CHECK(saved[2].turn == 1);
+  CHECK(saved[2].thinking.empty());
+
+  // Rewriting also creates the parent directory and keeps the file private.
+  const auto nested = root / "new" / "coder" / "messages.jsonl";
+  mtrxai::CoderTranscript::save(nested, {});
+  CHECK(std::filesystem::is_regular_file(nested));
+  CHECK(mtrxai::CoderTranscript::load(nested).empty());
+  const auto mode = std::filesystem::status(nested).permissions();
+  CHECK((mode & std::filesystem::perms::group_all) ==
+        std::filesystem::perms::none);
+  CHECK((mode & std::filesystem::perms::others_all) ==
+        std::filesystem::perms::none);
+
+  std::filesystem::remove_all(root);
+}
+
 TEST_CASE("parse_manifest_stage reads only a string completed_stage") {
   CHECK(mtrxai::parse_manifest_stage(
             R"({"completed_stage":"prompter","updated_at":"x"})") ==

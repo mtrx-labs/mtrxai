@@ -318,6 +318,29 @@ def check_resume(binary, root):
          "content": "midturn-ok\n"},
         {"action": "finish", "summary": "Created hello-midturn.txt."},
     ]
+    bad_answers = [
+        "Sorry, I cannot answer that.",
+        {"action": "delete_everything"},
+    ]
+    bad_resume_answers = [
+        {"action": "write_file", "path": "hello-bad.txt",
+         "content": "bad-ok\n"},
+        {"action": "finish", "summary": "Created hello-bad.txt."},
+    ]
+    bad_saved_retry_answers = ["still not a JSON action"]
+    bad_saved_valid_answers = [
+        {"action": "write_file", "path": "hello-saved.txt",
+         "content": "saved-ok\n"},
+        {"action": "finish", "summary": "Created hello-saved.txt."},
+    ]
+    phase_answers = {
+        "first": coder_answers,
+        "mid_turn": mid_turn_answers,
+        "bad": bad_answers,
+        "bad_resume": bad_resume_answers,
+        "bad_saved_retry": bad_saved_retry_answers,
+        "bad_saved_valid": bad_saved_valid_answers,
+    }
     counts = {"chief": 0, "prompter": 0, "coder": 0}
     state = {"fail_first_coder": True, "phase": "first", "coder_request": 0}
     coder_bodies = []
@@ -348,16 +371,16 @@ def check_resume(binary, root):
             elif role == "prompter":
                 content = prompter_answer
             else:
-                answers = (coder_answers if state["phase"] == "first"
-                           else mid_turn_answers)
+                answers = phase_answers[state["phase"]]
                 index = state["coder_request"]
                 state["coder_request"] += 1
                 assert 0 <= index < len(answers), "unexpected coder request"
-                content = json.dumps(answers[index])
+                answer = answers[index]
+                content = answer if isinstance(answer, str) else json.dumps(answer)
                 if index == 0:
                     # The first reply also exercises thinking persistence: the
                     # <think> block is stripped before the action is parsed and
-                    # stored separately in the transcript.
+                    # stored separately in the transcript (or rejected archive).
                     content = ("<think>Coder thinking process</think>" + content)
 
             self.send_response(200)
@@ -658,6 +681,202 @@ def check_resume(binary, root):
         stop(process, master)
     manifest = json.loads((pending_finish / "manifest.json").read_text())
     assert manifest["completed_stage"] == "finished", manifest
+
+    # Two unusable Coder replies for the same turn: the first is not JSON, the
+    # second is an unsupported action. Both are archived, the first gets a
+    # persisted correction, and the second aborts. The transcript never holds
+    # either reply, and resume continues from the correction.
+    bad_workspace = root / "resume-bad"
+    bad_workspace.mkdir()
+    state["phase"] = "bad"
+    state["coder_request"] = 0
+    first_bad_body = len(coder_bodies)
+    process, master, output = start([], cwd=bad_workspace)
+    try:
+        wait_for(output, master, "Describe what you want to build")
+        os.write(master, b"create hello-bad.txt\n")
+        wait_for(output, master, "Pipeline stopped:")
+        wait_for(output, master, "not valid actions")
+        wait_for(output, master, "Completed stage outputs remain saved")
+        os.write(master, b"\n")
+        wait_for(output, master, "Describe what you want to build")
+        os.write(master, b"/quit\n")
+        assert process.wait(timeout=10) == 0
+    finally:
+        stop(process, master)
+
+    bad_sessions = [entry for entry in sessions_root.iterdir()
+                    if (entry / "request.md").exists()
+                    and "hello-bad.txt" in (entry / "request.md").read_text()]
+    assert len(bad_sessions) == 1, bad_sessions
+    bad_session = bad_sessions[0]
+    bad_transcript = bad_session / "coder" / "messages.jsonl"
+    records = [json.loads(line)
+               for line in bad_transcript.read_text().splitlines()]
+    assert [record["role"] for record in records] == [
+        "system", "user", "user"], records
+    assert "Your previous reply was rejected" in records[2]["content"]
+    assert records[2]["turn"] == 1
+    rejected = list((bad_session / "coder" / "rejected").iterdir())
+    assert len(rejected) == 2, rejected
+    rejected_names = [entry.name for entry in rejected]
+    assert any(name.startswith("turn-1-malformed-") for name in rejected_names)
+    assert any(name.startswith("turn-1-unsupported-")
+               for name in rejected_names)
+    malformed = next(entry for entry in rejected
+                     if entry.name.startswith("turn-1-malformed-"))
+    unsupported = next(entry for entry in rejected
+                       if entry.name.startswith("turn-1-unsupported-"))
+    assert "Sorry, I cannot answer that." in malformed.read_text()
+    assert "Coder thinking process" in malformed.read_text()
+    assert "delete_everything" in unsupported.read_text()
+    # The live retry request carried the correction, so the model was told why
+    # its first reply could not be used.
+    retry_messages = coder_bodies[first_bad_body + 1]["messages"]
+    assert [message["role"] for message in retry_messages] == [
+        "user", "user"], retry_messages
+    assert "Your previous reply was rejected" in retry_messages[1]["content"]
+    assert "must be a JSON action" in retry_messages[1]["content"]
+    # Neither reply entered the conversation, and both raw streams were set
+    # aside so the retry could not read the old text back.
+    transcript_text = bad_transcript.read_text()
+    assert "Sorry, I cannot answer that." not in transcript_text
+    assert "delete_everything" not in transcript_text
+    raw_asides = list((bad_session / "coder").glob("raw.jsonl.before-resume-*"))
+    assert len(raw_asides) == 2, raw_asides
+    assert not (bad_session / "coder" / "raw.jsonl").exists()
+    manifest = json.loads((bad_session / "manifest.json").read_text())
+    assert manifest["completed_stage"] == "prompter", manifest
+
+    first_resume_body = len(coder_bodies)
+    state["phase"] = "bad_resume"
+    state["coder_request"] = 0
+    process, master, output = start(["--resume", bad_session.name],
+                                    cwd=bad_workspace)
+    try:
+        wait_for(output, master, "Resuming session")
+        wait_for(output, master, "Approve this exact file content?")
+        os.write(master, b"y")
+        wait_for(output, master, "Finished: Created hello-bad.txt.")
+        os.write(master, b"\n")
+        wait_for(output, master, "Describe what you want to build")
+        os.write(master, b"/quit\n")
+        assert process.wait(timeout=10) == 0
+    finally:
+        stop(process, master)
+
+    assert (bad_workspace / "hello-bad.txt").read_text() == "bad-ok\n"
+    manifest = json.loads((bad_session / "manifest.json").read_text())
+    assert manifest["completed_stage"] == "finished", manifest
+    records = [json.loads(line)
+               for line in bad_transcript.read_text().splitlines()]
+    assert [record["role"] for record in records] == [
+        "system", "user", "user", "assistant", "user", "assistant"], records
+    assert [record.get("turn", 0) for record in records] == [
+        0, 0, 1, 1, 1, 2], records
+    resume_messages = coder_bodies[first_resume_body]["messages"]
+    assert [message["role"] for message in resume_messages] == [
+        "user", "user"], resume_messages
+    assert "Your previous reply was rejected" in resume_messages[1]["content"]
+    assert "delete_everything" not in json.dumps(resume_messages)
+
+    # A transcript from before parse-before-persist can end with a saved reply
+    # that was never usable. Resume must discard it, save a correction, and
+    # allow only one fresh attempt for that turn.
+    saved_root = sessions_root / "29991231-235959-996"
+    shutil.copytree(mid_session, saved_root)
+    manifest = json.loads((saved_root / "manifest.json").read_text())
+    manifest["completed_stage"] = "coder-turn-1"
+    (saved_root / "manifest.json").write_text(json.dumps(manifest))
+    saved_transcript = saved_root / "coder" / "messages.jsonl"
+    records = [json.loads(line)
+               for line in saved_transcript.read_text().splitlines()]
+    # Keep the write and its tool result, drop the original finish, and append
+    # an unsupported saved reply for turn 2.
+    records = records[:4]
+    records.append({"role": "assistant",
+                    "content": json.dumps({"action": "explode"}),
+                    "turn": 2})
+    saved_transcript.write_text(
+        "".join(json.dumps(record) + "\n" for record in records))
+    state["phase"] = "bad_saved_retry"
+    state["coder_request"] = 0
+    process, master, output = start(["--resume", saved_root.name],
+                                    cwd=mid_workspace)
+    try:
+        wait_for(output, master, "discarded it")
+        wait_for(output, master, "Pipeline stopped:")
+        wait_for(output, master, "not valid actions")
+        wait_for(output, master, "Completed stage outputs remain saved")
+        os.write(master, b"\n")
+        wait_for(output, master, "Describe what you want to build")
+        os.write(master, b"/quit\n")
+        assert process.wait(timeout=10) == 0
+    finally:
+        stop(process, master)
+
+    recovered = list((saved_root / "coder" / "rejected").iterdir())
+    assert len(recovered) == 2, recovered
+    recovered_names = [entry.name for entry in recovered]
+    assert any(name.startswith("turn-2-unsupported-")
+               for name in recovered_names)
+    assert any(name.startswith("turn-2-malformed-")
+               for name in recovered_names)
+    recovered_unsupported = next(
+        entry for entry in recovered
+        if entry.name.startswith("turn-2-unsupported-"))
+    recovered_malformed = next(
+        entry for entry in recovered
+        if entry.name.startswith("turn-2-malformed-"))
+    assert "explode" in recovered_unsupported.read_text()
+    assert "still not a JSON action" in recovered_malformed.read_text()
+    records = [json.loads(line)
+               for line in saved_transcript.read_text().splitlines()]
+    assert [record["role"] for record in records] == [
+        "system", "user", "assistant", "user", "user"], records
+    assert records[-1]["turn"] == 2
+    assert "Your previous reply was rejected" in records[-1]["content"]
+    assert not any(record["role"] == "assistant" and
+                   "explode" in record["content"] for record in records)
+    assert list((saved_root / "coder").glob("raw.jsonl.before-resume-*"))
+    assert not (saved_root / "coder" / "raw.jsonl").exists()
+
+    # The persisted correction survives the abort. This resume gets a valid
+    # write and finish, and the model sees the correction in its context.
+    first_valid_body = len(coder_bodies)
+    state["phase"] = "bad_saved_valid"
+    state["coder_request"] = 0
+    process, master, output = start(["--resume", saved_root.name],
+                                    cwd=mid_workspace)
+    try:
+        wait_for(output, master, "Resuming session")
+        wait_for(output, master, "Approve this exact file content?")
+        os.write(master, b"y")
+        wait_for(output, master, "Finished: Created hello-saved.txt.")
+        os.write(master, b"\n")
+        wait_for(output, master, "Describe what you want to build")
+        os.write(master, b"/quit\n")
+        assert process.wait(timeout=10) == 0
+    finally:
+        stop(process, master)
+
+    assert (mid_workspace / "hello-saved.txt").read_text() == "saved-ok\n"
+    manifest = json.loads((saved_root / "manifest.json").read_text())
+    assert manifest["completed_stage"] == "finished", manifest
+    records = [json.loads(line)
+               for line in saved_transcript.read_text().splitlines()]
+    assert [record["role"] for record in records] == [
+        "system", "user", "assistant", "user", "user", "assistant", "user",
+        "assistant"], records
+    assert [record.get("turn", 0) for record in records] == [
+        0, 0, 1, 1, 2, 2, 2, 3], records
+    retry_messages = coder_bodies[first_valid_body]["messages"]
+    assert [message["role"] for message in retry_messages] == [
+        "user", "assistant", "user", "user"], retry_messages
+    assert "Your previous reply was rejected" in \
+        retry_messages[-1]["content"]
+
+    assert counts == {"chief": 3, "prompter": 3, "coder": 12}, counts
 
     server.shutdown()
 
