@@ -1,4 +1,5 @@
 #include "mtrxai/provider.hpp"
+#include "mtrxai/cancel.hpp"
 #include "mtrxai/signals.hpp"
 #include "mtrxai/stream_parse.hpp"
 
@@ -19,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/prctl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -87,7 +89,15 @@ struct StreamContext {
   std::string pending;
   std::function<void(const std::string&)> on_line;
   std::atomic<bool>* cancelled = nullptr;
+  const CancelToken* external_cancel = nullptr;
   std::exception_ptr error;
+
+  bool cancel_requested() const {
+    return (cancelled != nullptr &&
+            cancelled->load(std::memory_order_relaxed)) ||
+           (external_cancel != nullptr && external_cancel->cancelled()) ||
+           process_cancel_token().cancelled();
+  }
 
   void run_line(const std::string& line) {
     if (error) return;
@@ -102,8 +112,7 @@ struct StreamContext {
 std::size_t stream_lines(char* data, std::size_t size, std::size_t count,
                          void* destination) {
   auto& context = *static_cast<StreamContext*>(destination);
-  if (context.cancelled != nullptr &&
-      context.cancelled->load(std::memory_order_relaxed)) {
+  if (context.cancel_requested()) {
     return 0;  // aborts the transfer with CURLE_WRITE_ERROR
   }
   const std::size_t bytes = size * count;
@@ -131,12 +140,14 @@ void post_json_lines(
     const std::function<void(const std::string&)>& on_line,
     const std::string& api_key = "",
     const std::vector<std::string>& extra_headers = {},
-    std::atomic<bool>* cancelled = nullptr) {
+    std::atomic<bool>* cancelled = nullptr,
+    const CancelToken* external_cancel = nullptr) {
   CURL* curl = curl_easy_init();
   if (curl == nullptr) throw std::runtime_error("Could not create HTTP request");
   StreamContext context;
   context.on_line = on_line;
   context.cancelled = cancelled;
+  context.external_cancel = external_cancel;
   long status = 0;
   struct curl_slist* headers = nullptr;
   headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -237,7 +248,8 @@ std::string normalize_url(std::string url) {
 std::string ollama_generate(const ModelSlot& slot, const Messages& messages,
                             const std::string& base_url,
                             const TokenSink& on_token,
-                            std::atomic<bool>* cancelled) {
+                            std::atomic<bool>* cancelled,
+                            const CancelToken* external_cancel) {
   Json body(json_object_new_object());
   json_object_object_add(body.get(), "model",
                          json_object_new_string(slot.model.c_str()));
@@ -270,7 +282,7 @@ std::string ollama_generate(const ModelSlot& slot, const Messages& messages,
         content += delta;
         if (on_token) on_token(delta);
       },
-      "", {}, cancelled);
+      "", {}, cancelled, external_cancel);
   if (content.empty()) {
     throw std::runtime_error("Ollama stream produced no content");
   }
@@ -281,7 +293,8 @@ std::string openai_generate(const ModelSlot& slot, const Messages& messages,
                             const std::string& base_url,
                             const std::string& api_key,
                             const TokenSink& on_token,
-                            std::atomic<bool>* cancelled) {
+                            std::atomic<bool>* cancelled,
+                            const CancelToken* external_cancel) {
   Json body(json_object_new_object());
   json_object_object_add(body.get(), "model",
                          json_object_new_string(slot.model.c_str()));
@@ -314,7 +327,7 @@ std::string openai_generate(const ModelSlot& slot, const Messages& messages,
                                    stream::error_message(payload));
         }
       },
-      api_key, {}, cancelled);
+      api_key, {}, cancelled, external_cancel);
   if (content.empty()) {
     throw std::runtime_error("Endpoint stream produced no content");
   }
@@ -325,12 +338,13 @@ std::string anthropic_generate(const ModelSlot& slot, const Messages& messages,
                                const std::string& base_url,
                                const std::string& api_key,
                                const TokenSink& on_token,
-                               std::atomic<bool>* cancelled) {
+                               std::atomic<bool>* cancelled,
+                               const CancelToken* external_cancel) {
   Json body(json_object_new_object());
   json_object_object_add(body.get(), "model",
                          json_object_new_string(slot.model.c_str()));
   json_object_object_add(body.get(), "max_tokens",
-                         json_object_new_int(slot.max_tokens > 0 ? slot.max_tokens : 4096));
+                         json_object_new_int(slot.max_tokens));
   json_object_object_add(body.get(), "stream", json_object_new_boolean(true));
   Json request_messages(json_object_new_array());
   std::string system_prompt;
@@ -374,7 +388,7 @@ std::string anthropic_generate(const ModelSlot& slot, const Messages& messages,
         content += delta;
         if (on_token) on_token(delta);
       },
-      "", headers, cancelled);
+      "", headers, cancelled, external_cancel);
   if (content.empty()) {
     throw std::runtime_error("Anthropic stream produced no content");
   }
@@ -404,8 +418,10 @@ unsigned short available_port() {
 
 class LlamaServer {
  public:
-  LlamaServer(const ModelSlot& slot, const std::function<void(const std::string&)>& status)
-      : port_(available_port()) {
+  LlamaServer(const ModelSlot& slot,
+              const std::function<void(const std::string&)>& status,
+              const CancelToken* cancel)
+      : port_(available_port()), cancel_(cancel) {
     if (access(slot.gguf_path.c_str(), R_OK) != 0) {
       throw std::runtime_error("GGUF file is not readable: " + slot.gguf_path);
     }
@@ -416,6 +432,14 @@ class LlamaServer {
     if (error) {
       throw std::runtime_error("Could not create logs directory: " + error.message());
     }
+    std::filesystem::permissions(
+        log_file.parent_path(),
+        std::filesystem::perms::owner_all,
+        std::filesystem::perm_options::replace, error);
+    if (error) {
+      throw std::runtime_error("Could not protect logs directory: " +
+                               error.message());
+    }
     status("Starting llama-server (one local model at a time)...");
     pid_ = fork();
     if (pid_ < 0) throw std::runtime_error("Could not start llama-server");
@@ -424,9 +448,20 @@ class LlamaServer {
       if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) _exit(126);
       if (getppid() == 1) _exit(1);
 
-      // Redirect stdout and stderr to the role log file so the TUI is not corrupted
-      const int log_fd = open(log_file.c_str(), O_CREAT | O_WRONLY | O_APPEND, 0600);
+      // The child must never write to the terminal: llama-server is chatty
+      // while loading and would corrupt the ncurses/FTXUI screen. Keep its
+      // diagnostics in a private per-role log instead.
+      const int devnull_in = open("/dev/null", O_RDONLY);
+      if (devnull_in >= 0) {
+        dup2(devnull_in, STDIN_FILENO);
+        close(devnull_in);
+      }
+      const int log_fd =
+          open(log_file.c_str(), O_CREAT | O_WRONLY | O_APPEND, 0600);
       if (log_fd >= 0) {
+        // O_CREAT mode only applies to a new file; enforce owner-only even if
+        // an older log was created with broader permissions.
+        fchmod(log_fd, 0600);
         dup2(log_fd, STDOUT_FILENO);
         dup2(log_fd, STDERR_FILENO);
         close(log_fd);
@@ -450,6 +485,11 @@ class LlamaServer {
     const int timeout = std::clamp(slot.gguf_load_timeout_seconds, 1, 3600);
     const int attempts = timeout * 4;
     for (int attempt = 0; attempt < attempts; ++attempt) {
+      if ((cancel_ != nullptr && cancel_->cancelled()) ||
+          process_cancel_token().cancelled()) {
+        stop();
+        throw Cancelled("Cancelled while starting llama-server.");
+      }
       int child_status = 0;
       if (waitpid(pid_, &child_status, WNOHANG) == pid_) {
         pid_ = -1;
@@ -503,6 +543,7 @@ class LlamaServer {
 
   pid_t pid_ = -1;
   unsigned short port_;
+  const CancelToken* cancel_ = nullptr;
 };
 
 std::string environment_key(const std::string& name) {
@@ -523,11 +564,15 @@ struct InferenceSession::Impl {
   std::string endpoint;
   std::string api_key;
   std::unique_ptr<LlamaServer> llama_server;
+  const CancelToken* external_cancel = nullptr;
   bool released = false;
   std::atomic<bool> cancelled{false};
 
-  Impl(const ModelSlot& model, const Status& update)
-      : slot(model), status(update), base_url(normalize_url(model.base_url)) {
+  Impl(const ModelSlot& model, const Status& update, const CancelToken* cancel)
+      : slot(model),
+        status(update),
+        base_url(normalize_url(model.base_url)),
+        external_cancel(cancel) {
     if (slot.provider == "ollama") {
       if (base_url.empty()) {
         throw std::runtime_error("An Ollama URL is required for " + slot.name);
@@ -569,7 +614,7 @@ struct InferenceSession::Impl {
             ". Set gguf_path in config.json or use `/gguf " + slot.name +
             " /path/to/model.gguf` in the TUI.");
       }
-      llama_server = std::make_unique<LlamaServer>(slot, status);
+      llama_server = std::make_unique<LlamaServer>(slot, status, external_cancel);
       endpoint = llama_server->endpoint();
       return;
     }
@@ -577,8 +622,9 @@ struct InferenceSession::Impl {
   }
 };
 
-InferenceSession::InferenceSession(const ModelSlot& slot, const Status& status)
-    : impl_(std::make_unique<Impl>(slot, status)) {}
+InferenceSession::InferenceSession(const ModelSlot& slot, const Status& status,
+                                   const CancelToken* cancel)
+    : impl_(std::make_unique<Impl>(slot, status, cancel)) {}
 
 InferenceSession::~InferenceSession() noexcept {
   // Cancellation unwinds through this destructor; try to unload the model
@@ -602,19 +648,24 @@ std::string InferenceSession::generate(const Messages& messages,
   if (impl_->released) {
     throw std::runtime_error("Cannot generate after the model stage is unloaded.");
   }
-  if (impl_->cancelled.load(std::memory_order_relaxed)) {
+  if (impl_->cancelled.load(std::memory_order_relaxed) ||
+      process_cancel_token().cancelled() ||
+      (impl_->external_cancel != nullptr &&
+       impl_->external_cancel->cancelled())) {
     throw Cancelled();
   }
   if (impl_->slot.provider == "ollama") {
     return ollama_generate(impl_->slot, messages, impl_->base_url, on_token,
-                           &impl_->cancelled);
+                           &impl_->cancelled, impl_->external_cancel);
   }
   if (impl_->slot.provider == "anthropic") {
     return anthropic_generate(impl_->slot, messages, impl_->base_url,
-                              impl_->api_key, on_token, &impl_->cancelled);
+                              impl_->api_key, on_token, &impl_->cancelled,
+                              impl_->external_cancel);
   }
   return openai_generate(impl_->slot, messages, impl_->endpoint, impl_->api_key,
-                         on_token, &impl_->cancelled);
+                         on_token, &impl_->cancelled,
+                         impl_->external_cancel);
 }
 
 void InferenceSession::request_cancel() {

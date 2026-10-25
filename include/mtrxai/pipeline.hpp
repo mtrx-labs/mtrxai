@@ -3,6 +3,7 @@
 #include "mtrxai/config.hpp"
 #include "mtrxai/provider.hpp"
 #include "mtrxai/safety.hpp"
+#include "mtrxai/textutil.hpp"
 
 #include <atomic>
 #include <filesystem>
@@ -10,15 +11,6 @@
 #include <string>
 
 namespace mtrxai {
-
-struct ThinkingResult {
-  std::string content;
-  std::string thinking;
-};
-
-// Strips <think>...</think> blocks from text and returns both the clean content
-// and any extracted thinking/reasoning text.
-ThinkingResult extract_thinking(const std::string& text);
 
 class Pipeline {
  public:

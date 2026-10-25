@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 
+#include "mtrxai/cancel.hpp"
 #include "mtrxai/coder_transcript.hpp"
 #include "mtrxai/files.hpp"
 #include "mtrxai/pipeline.hpp"
@@ -138,6 +139,28 @@ TEST_CASE("extract_thinking separates reasoning from answer") {
     CHECK(res.thinking.empty());
     CHECK(res.content == "Direct response with no tags");
   }
+
+  SUBCASE("missing opening tag") {
+    const auto res = mtrxai::extract_thinking(
+        "Reasoning without an opening tag\n</think>\nVisible answer");
+    CHECK(res.thinking == "Reasoning without an opening tag");
+    CHECK(res.content == "Visible answer");
+  }
+
+}
+
+TEST_CASE("CancelToken latches cancellation") {
+  mtrxai::CancelToken token;
+  CHECK_FALSE(token.cancelled());
+  token.cancel();
+  CHECK(token.cancelled());
+  token.cancel();
+  CHECK(token.cancelled());
+}
+
+TEST_CASE("process signal accessors are safe") {
+  CHECK(mtrxai::process_signal() >= 0);
+  CHECK_FALSE(mtrxai::process_cancel_token().cancelled());
 }
 
 TEST_CASE("ModelSlot defaults max_tokens to 4096") {
@@ -178,6 +201,27 @@ TEST_CASE("Config defaults and serialization of turns, timeout, and context") {
   std::filesystem::remove(temp_config_path);
 }
 
+
+TEST_CASE("old configs without max_tokens still load with defaults") {
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("mtrxai_old_config_" + std::to_string(::getpid()) +
+                     ".json");
+  {
+    std::ofstream output(path);
+    output << R"({
+      "chief":{"provider":"ollama","model":"c","base_url":"http://127.0.0.1:11434"},
+      "prompter":{"provider":"ollama","model":"p","base_url":"http://127.0.0.1:11434"},
+      "coder":{"provider":"ollama","model":"x","base_url":"http://127.0.0.1:11434"}
+    })";
+  }
+  const auto config = mtrxai::load_config(path);
+  CHECK(config.chief.max_tokens == 4096);
+  CHECK(config.prompter.max_tokens == 4096);
+  CHECK(config.coder.max_tokens == 4096);
+  CHECK(config.max_turns == 40);
+  CHECK(config.gguf_load_timeout_seconds == 150);
+  std::filesystem::remove(path);
+}
 
 TEST_CASE("utf8_encode covers ASCII, two-, three-, and four-byte characters") {
   CHECK(mtrxai::utf8_encode(L'A') == "A");

@@ -1,5 +1,6 @@
 #include "mtrxai/pipeline.hpp"
 
+#include "mtrxai/cancel.hpp"
 #include "mtrxai/coder_transcript.hpp"
 #include "mtrxai/files.hpp"
 #include "mtrxai/provider.hpp"
@@ -36,64 +37,6 @@
 #include <unistd.h>
 
 namespace mtrxai {
-
-ThinkingResult extract_thinking(const std::string& text) {
-  ThinkingResult result;
-  std::size_t pos = 0;
-  const std::string open_tag = "<think>";
-  const std::string close_tag = "</think>";
-
-  auto find_ci = [](const std::string& haystack, const std::string& needle,
-                    std::size_t start) {
-    if (needle.empty() || start >= haystack.size()) return std::string::npos;
-    auto it = std::search(
-        haystack.begin() + start, haystack.end(), needle.begin(), needle.end(),
-        [](char c1, char c2) {
-          return std::tolower(static_cast<unsigned char>(c1)) ==
-                 std::tolower(static_cast<unsigned char>(c2));
-        });
-    if (it == haystack.end()) return std::string::npos;
-    return static_cast<std::size_t>(std::distance(haystack.begin(), it));
-  };
-
-  while (pos < text.size()) {
-    const std::size_t open_pos = find_ci(text, open_tag, pos);
-    if (open_pos == std::string::npos) {
-      result.content.append(text.substr(pos));
-      break;
-    }
-    result.content.append(text.substr(pos, open_pos - pos));
-    const std::size_t think_start = open_pos + open_tag.size();
-    const std::size_t close_pos = find_ci(text, close_tag, think_start);
-    if (close_pos == std::string::npos) {
-      const std::string block = text.substr(think_start);
-      if (!block.empty()) {
-        if (!result.thinking.empty()) result.thinking += "\n\n";
-        result.thinking += block;
-      }
-      pos = text.size();
-      break;
-    } else {
-      const std::string block = text.substr(think_start, close_pos - think_start);
-      if (!block.empty()) {
-        if (!result.thinking.empty()) result.thinking += "\n\n";
-        result.thinking += block;
-      }
-      pos = close_pos + close_tag.size();
-    }
-  }
-
-  auto trim = [](std::string s) {
-    const auto first = s.find_first_not_of(" \t\r\n");
-    if (first == std::string::npos) return std::string();
-    const auto last = s.find_last_not_of(" \t\r\n");
-    return s.substr(first, last - first + 1);
-  };
-
-  result.content = trim(result.content);
-  result.thinking = trim(result.thinking);
-  return result;
-}
 
 namespace {
 
@@ -350,7 +293,8 @@ std::string read_file(const std::filesystem::path& root,
 }
 
 std::string run_command(const std::filesystem::path& root,
-                        const std::string& command, int timeout_seconds) {
+                        const std::string& command, int timeout_seconds,
+                        const CancelToken* cancel) {
   if (command.empty() || command.size() > 4096) {
     throw std::runtime_error("Command must be between 1 and 4096 characters.");
   }
@@ -417,6 +361,15 @@ std::string run_command(const std::filesystem::path& root,
   bool truncated = false;
   char buffer[4096];
   while (!exited || !eof) {
+    if ((cancel != nullptr && cancel->cancelled()) ||
+        process_cancel_token().cancelled()) {
+      kill(-child, SIGTERM);
+      kill(child, SIGTERM);
+      waitpid(child, nullptr, 0);
+      mtrxai::signals::set_active_child(0);
+      close(output_pipe[0]);
+      throw Cancelled("Cancelled while running the approved command.");
+    }
     const auto now = std::chrono::steady_clock::now();
     if (!timed_out && now >= deadline && (!exited || !eof)) {
       timed_out = true;
@@ -654,7 +607,8 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
   // later run for the rest of the session.
   cancelled_.store(false, std::memory_order_relaxed);
   auto throw_if_cancelled = [this](const std::string& point) {
-    if (cancelled_.load(std::memory_order_relaxed)) {
+    if (cancelled_.load(std::memory_order_relaxed) ||
+        process_cancel_token().cancelled()) {
       throw Cancelled("Cancelled at " + point + ".");
     }
   };
@@ -752,7 +706,7 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
     if (resuming) move_aside(chief_raw_path);
     {
       RawRecorder recorder(chief_raw_path);
-      InferenceSession model(config_.chief, status);
+      InferenceSession model(config_.chief, status, &process_cancel_token());
       ActiveSessionGuard active(active_session_, model);
       model.generate({{"system", chief_instructions()}, {"user", request}},
                      wrap_tokens(recorder, 0));
@@ -761,7 +715,7 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
     const std::string chief_raw = read_raw_text(chief_raw_path, 0);
     const auto chief = extract_thinking(chief_raw);
     if (!chief.thinking.empty()) {
-      write_atomic(session / "chief_thinking.md", chief.thinking);
+      write_atomic(session / "chief.reasoning.md", chief.thinking);
     }
     write_atomic(session / "chief.md", chief.content);
     save_manifest(session, "chief");
@@ -788,7 +742,7 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
     if (resuming) move_aside(prompt_raw_path);
     {
       RawRecorder recorder(prompt_raw_path);
-      InferenceSession model(config_.prompter, status);
+      InferenceSession model(config_.prompter, status, &process_cancel_token());
       ActiveSessionGuard active(active_session_, model);
       model.generate(
           {{"system", prompter_instructions()}, {"user", prompt_input}},
@@ -798,7 +752,7 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
     const std::string prompt_raw = read_raw_text(prompt_raw_path, 0);
     const auto prompt = extract_thinking(prompt_raw);
     if (!prompt.thinking.empty()) {
-      write_atomic(session / "prompt_thinking.md", prompt.thinking);
+      write_atomic(session / "prompt.reasoning.md", prompt.thinking);
     }
     write_atomic(session / "prompt.md", prompt.content);
     save_manifest(session, "prompter");
@@ -1003,7 +957,8 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
              << "Working directory: project root\n\n"
              << "Approve this exact command?";
       if (confirm(review.str())) {
-        return run_command(root, action.command, timeout);
+        return run_command(root, action.command, timeout,
+                           &process_cancel_token());
       }
       return "User declined this command. It was not executed.";
     }
@@ -1019,7 +974,7 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
     if (!coder_model) {
       status("Coder: " + (config_.coder.model.empty() ? config_.coder.gguf_path
                                                        : config_.coder.model));
-      coder_model = std::make_unique<InferenceSession>(config_.coder, status);
+      coder_model = std::make_unique<InferenceSession>(config_.coder, status, &process_cancel_token());
       active =
           std::make_unique<ActiveSessionGuard>(active_session_, *coder_model);
     }

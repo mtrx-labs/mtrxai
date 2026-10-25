@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mtrxai/cancel.hpp"
 #include "mtrxai/config.hpp"
 
 #include <atomic>
@@ -31,7 +32,10 @@ class InferenceSession {
   // Receives each decoded text chunk as the model streams it. Must not throw.
   using TokenSink = std::function<void(const std::string&)>;
 
-  InferenceSession(const ModelSlot& slot, const Status& status);
+  // The optional token aborts model loading and generation. The process-wide
+  // SIGINT/SIGTERM token is always checked as well.
+  explicit InferenceSession(const ModelSlot& slot, const Status& status,
+                            const CancelToken* cancel = nullptr);
   ~InferenceSession() noexcept;
   InferenceSession(const InferenceSession&) = delete;
   InferenceSession& operator=(const InferenceSession&) = delete;

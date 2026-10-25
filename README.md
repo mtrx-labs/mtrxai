@@ -186,7 +186,8 @@ keeps rendering live output and status; press Esc to cancel the current job,
 which aborts the active request and keeps completed stage files on disk. The
 transcript pane follows the newest output as it grows. Model `<think>...</think>` blocks are stripped before passing outputs to downstream
 roles to prevent context pollution, and reasoning is saved in separate session
-artifacts (`chief_thinking.md`, `prompt_thinking.md`, `coder_turn_<N>_thinking.md`).
+artifacts (`chief.reasoning.md`, `prompt.reasoning.md`,
+`coder_turn_<N>_thinking.md`).
 When running local GGUF models, `llama-server` stdout and stderr are
 redirected to `$XDG_STATE_HOME/mtrxai/logs/<role>.log` (mode 0600) to keep the TUI
 display clean. Signal handlers for SIGINT and SIGTERM cleanly terminate child

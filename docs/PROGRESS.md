@@ -22,10 +22,30 @@ to it rather than replacing it.
 - The e2e test skips the `/proc/$PPID/environ` permission assertion as root and prints the reason.
 - Build and ctest pass locally as uid 1000.
 
-**Next.** PR 2: exact sensitive-file matching, llama-server log redirection, per-role
-`max_tokens`, reasoning extraction/persistence, cancellation token, and configurable
-turn/timeout limits.
-
 **Known risks / not run.** Real Ollama, real GGUF/llama-server, and non-Ubuntu
 distributions were not exercised. CI uses FetchContent, so the first configure
 needs network access.
+
+## PR 2 — correctness and safety
+
+**Plan (5 lines).**
+1. Keep exact sensitive-file names/patterns and prove the false positives stay readable.
+2. Redirect llama-server stdout/stderr to a private role log and stdin to `/dev/null`.
+3. Wire per-role `max_tokens` into all three providers, including Anthropic.
+4. Strip reasoning tags, persist `chief.reasoning.md`/`prompt.reasoning.md`, and add `CancelToken`.
+5. Check cancellation in the pipeline, llama-server wait, command runner, and Coder loop; return 130 on SIGINT.
+
+**Done.**
+- `sensitive_filename()` matches exact names, `.env.*`, key/certificate suffixes, and SSH key prefixes only.
+- `llama-server` writes to `$XDG_STATE_HOME/mtrxai/logs/<role>.log` (fallback `~/.local/state`), mode 0600; stdin is `/dev/null`; log directory is owner-only.
+- `ModelSlot::max_tokens` defaults to 4096 for old configs and maps to Ollama `num_predict`, OpenAI `max_tokens`, and Anthropic `max_tokens`.
+- `extract_thinking()` handles canonical and legacy tags, missing opening tags, and unclosed blocks. Chief/Prompter reasoning is saved as `chief.reasoning.md` and `prompt.reasoning.md`.
+- `include/mtrxai/cancel.hpp` provides `CancelToken` (`cancel()`, `cancelled()`) and `process_cancel_token()`.
+- SIGINT/SIGTERM handlers only set the process token; the pipeline, llama-server startup, command runner, and Coder loop observe it. The TUI stops its worker, unloads Ollama, restores the terminal, and returns `128 + signal` (130 for SIGINT).
+- `Config::max_turns` (default 40) and GGUF load timeout (default 150 s) load from old and new configs.
+
+**Next.** PR 3: `events.hpp`, event-driven pipeline API, streaming reasoning chunks,
+raw-first per-call logs, and replay-derived artifacts.
+
+**Known risks / not run.** Real Ollama/GGUF and real Anthropic streaming were not run;
+their protocols are covered by unit tests and mock servers.

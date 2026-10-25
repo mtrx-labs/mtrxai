@@ -33,6 +33,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(ftxui)
 
 add_library(mtrxai_core STATIC
+  src/cancel.cpp
   src/coder_transcript.cpp
   src/config.cpp
   src/files.cpp

@@ -1298,8 +1298,8 @@ def run(binary):
         session = session_dirs[0]
         assert (session / "request.md").exists()
         assert (session / "chief.md").exists()
-        assert (session / "chief_thinking.md").exists()
-        assert (session / "chief_thinking.md").read_text().strip() == "Chief thinking process"
+        assert (session / "chief.reasoning.md").exists()
+        assert (session / "chief.reasoning.md").read_text().strip() == "Chief thinking process"
         # Raw streams: tokens persisted verbatim before the derived artifacts.
         for stage in ("chief", "prompt", "coder"):
             raw_file = session / stage / "raw.jsonl"

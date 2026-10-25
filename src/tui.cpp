@@ -2,6 +2,7 @@
 
 #include "mtrxai/pipeline.hpp"
 #include "mtrxai/session.hpp"
+#include "mtrxai/cancel.hpp"
 #include "mtrxai/signals.hpp"
 #include "mtrxai/utf8.hpp"
 
@@ -12,6 +13,9 @@
 #include <ftxui/screen/terminal.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <csignal>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -381,7 +385,22 @@ class Ui {
     auto root = ftxui::CatchEvent(
         ftxui::Renderer([this] { return render(); }),
         [this](ftxui::Event event) { return on_event(std::move(event)); });
+    // The signal handler only sets a token. Poll it from a helper thread so the
+    // UI loop wakes up and can stop the worker, unload the model, and restore
+    // the terminal through the normal shutdown path.
+    std::atomic<bool> monitor_stop{false};
+    std::thread monitor([this, &monitor_stop]() {
+      while (!monitor_stop.load(std::memory_order_relaxed)) {
+        if (process_cancel_token().cancelled()) {
+          screen_.PostEvent(ftxui::Event::Custom);
+          return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+    });
     screen_.Loop(root);
+    monitor_stop.store(true, std::memory_order_relaxed);
+    if (monitor.joinable()) monitor.join();
     stop_worker();
   }
 
@@ -973,9 +992,15 @@ class Ui {
 
   bool on_event(ftxui::Event event) {
     using namespace ftxui;
+    // SIGINT/SIGTERM only sets the process token. Stop the worker here so its
+    // destructor stops any llama-server and unloads Ollama before we exit.
+    if (process_cancel_token().cancelled()) {
+      stop_worker();
+      screen_.Exit();
+      return true;
+    }
     // Let FTXUI turn Ctrl-C / Ctrl-Z into the signals its terminal cleanup
-    // already knows how to handle; the app's signal handler then unloads the
-    // active model and exits.
+    // already knows how to handle.
     if (event == Event::CtrlC || event == Event::CtrlZ) return false;
     pump();
     if (review_active_) return handle_review(event);
@@ -1018,6 +1043,10 @@ int run_tui(Config& config, const std::filesystem::path& config_file,
             const std::filesystem::path& resume_session) {
   Ui ui(config, config_file);
   ui.run(resume_session);
+  const int signal = process_signal();
+  if (process_cancel_token().cancelled() && signal != 0) {
+    return 128 + signal;
+  }
   return 0;
 }
 
