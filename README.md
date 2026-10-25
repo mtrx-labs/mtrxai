@@ -127,6 +127,22 @@ inside the TUI after switching providers. A locally running llama.cpp server
 can also be used as an OpenAI-compatible endpoint. For direct GGUF use, install
 `llama-server`; mtrxAI starts it for the Coder stage and terminates it afterward.
 
+Verified Ollama tags (checked against the Ollama library in October 2026):
+
+```sh
+ollama pull deepseek-r1:8b               # Chief of Staff, 5.2 GB
+ollama pull qwen3:4b-instruct            # Prompter, 2.5 GB
+```
+
+There is no plain `qwen3:4b-instruct-2507` tag; `qwen3:4b-instruct` serves the
+same weights (digest 0edcdef34593, the Qwen3-4B-Instruct-2507 build, 256K
+context). Pin `qwen3:4b-instruct-2507-q4_K_M` if you prefer an exact quant tag.
+The Mellum Coder model is not in the Ollama library; pull the Hugging Face GGUF
+with `ollama pull hf.co/JetBrains/Mellum2.1-12B-A2.5B-Thinking-GGUF:Q4_K_M`
+(about 7.5 GB) or download a GGUF file and set it with `/gguf coder`. The
+Q6_K variant is about 11 GB and will not fit a 16 GB machine alongside the OS;
+use Q4_K_M.
+
 ## Applying code
 
 The Coder iteratively lists and reads project files, requests individual file
