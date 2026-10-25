@@ -141,6 +141,151 @@ def check_setup_wizard(binary, root):
         os.close(master)
 
 
+def check_esc_cancellation(binary, root):
+    """Esc during a running pipeline must abort the request and leave the
+    session usable, so a follow-up task still runs to completion."""
+    workspace = root / "esc-workspace"
+    workspace.mkdir()
+    chief_answers = [
+        "<think>Chief thinking process</think>Chief brief: create hello.txt with the content hello-ok.",
+        "<think>Chief thinking process</think>Chief brief: create hello.txt with hello-ok.",
+    ]
+    prompter_answers = [
+        "<think>Prompter thinking process</think>Prompter brief: write hello.txt containing hello-ok.",
+    ]
+    coder_answers = [
+        {"action": "write_file", "path": "hello.txt", "content": "hello-ok\n"},
+        {"action": "finish", "summary": "Created hello.txt."},
+    ]
+    # A stage only consumes its scripted answer when the response was fully
+    # delivered, so an Esc-aborted chief request does not shift later answers.
+    served = {"chief": 0, "prompter": 0, "coder": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(
+                self.rfile.read(int(self.headers["Content-Length"])))
+            model = str(body.get("model", ""))
+            role = ("chief" if model.startswith("chief-")
+                    else "prompter" if model.startswith("prompter-")
+                    else "coder")
+            index = served[role]
+            if index >= len(chief_answers if role == "chief" else
+                            prompter_answers if role == "prompter" else
+                            coder_answers):
+                raise AssertionError(f"unexpected request for {role}")
+            pool = {"chief": chief_answers, "prompter": prompter_answers,
+                    "coder": coder_answers}[role]
+            answer = pool[index]
+            content = (answer if isinstance(answer, str) else json.dumps(answer))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            # The chief streams slowly so the test can press Esc mid-request.
+            interval = 0.25 if role == "chief" else 0.0
+            try:
+                for start in range(0, len(content), 9):
+                    if interval:
+                        time.sleep(interval)
+                    event = json.dumps(
+                        {"type": "content_block_delta",
+                         "delta": {"type": "text_delta",
+                                   "text": content[start:start + 9]}})
+                    self.wfile.write(f"data: {event}\n\n".encode())
+                    self.wfile.flush()
+                self.wfile.write(b"data: {\"type\":\"message_stop\"}\n\n")
+                self.wfile.flush()
+                served[role] = index + 1
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the client aborted; leave `served` untouched
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    config = {}
+    for role in ("chief", "prompter", "coder"):
+        config[role] = {
+            "provider": "anthropic",
+            "model": f"{role}-esc",
+            "base_url": f"http://127.0.0.1:{server.server_port}",
+            "api_key_env": "",
+            "gguf_path": "",
+            "context_size": 2048,
+        }
+    config_home = root / "esc-config"
+    config_path = config_home / "mtrxai" / "config.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps(config))
+    credentials_path = config_path.parent / "credentials.json"
+    credentials_path.write_text(
+        json.dumps({"chief": "esc-key", "prompter": "esc-key", "coder": "esc-key"}))
+    credentials_path.chmod(0o600)
+    env = os.environ.copy()
+    env.update({
+        "XDG_CONFIG_HOME": str(config_home),
+        "XDG_STATE_HOME": str(root / "esc-state"),
+        "TERM": "xterm",
+    })
+    master, slave = pty.openpty()
+    process = subprocess.Popen(
+        [binary, "--no-update-check"], cwd=workspace, env=env,
+        stdin=slave, stdout=slave, stderr=slave
+    )
+    os.close(slave)
+    output = bytearray()
+
+    def wait_for(needle, timeout=20):
+        target = needle.encode()
+        deadline = time.time() + timeout
+        while target not in output and time.time() < deadline:
+            readable, _, _ = select.select([master], [], [], 0.2)
+            if readable:
+                try:
+                    output.extend(os.read(master, 8192))
+                except OSError:
+                    break
+        if target not in output:
+            raise AssertionError(
+                f"Timed out waiting for {needle!r}: "
+                f"{output.decode(errors='replace')[-1500:]}")
+
+    try:
+        wait_for("Describe what you want to build")
+        os.write(master, b"make hello.txt\n")
+        output.clear()
+        # Early chief tokens prove streaming started; Esc now interrupts the
+        # open request instead of merely declining a review. The needle is a
+        # single streamed fragment because ncurses only writes changed cells.
+        wait_for("think")
+        os.write(master, b"\x1b")
+        wait_for("Cancelled. Completed stage outputs remain saved on disk.")
+        time.sleep(0.3)
+        os.write(master, b"\n")
+        wait_for("Describe what you want to build")
+        os.write(master, b"make hello.txt\n")
+        output.clear()
+        wait_for("Approve this exact file content?")
+        os.write(master, b"y")
+        wait_for("Created hello.txt.")
+        os.write(master, b"\n")
+        wait_for("Describe what you want to build")
+        os.write(master, b"/quit\n")
+        assert process.wait(timeout=10) == 0
+        assert (workspace / "hello.txt").read_text() == "hello-ok\n"
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        server.shutdown()
+        os.close(master)
+
+
 def check_signal_handling(binary, root):
     user_home = root / "signal-home"
     user_home.mkdir()
@@ -221,6 +366,7 @@ def run(binary):
     temp = Path(tempfile.mkdtemp(prefix="mtrxai-e2e-"))
     check_setup_wizard(binary, temp)
     check_signal_handling(binary, temp)
+    check_esc_cancellation(binary, temp)
     workspace = temp / "workspace"
     outside = temp / "outside"
     config_home = temp / "config"
@@ -567,4 +713,4 @@ def run(binary):
 
 if __name__ == "__main__":
     run(sys.argv[1])
-    print("Sequential stages, iterative coder tools, approvals, and persistence passed.")
+    print("Sequential stages, iterative coder tools, approvals, persistence, and Esc cancellation passed.")

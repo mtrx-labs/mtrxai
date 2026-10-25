@@ -581,6 +581,14 @@ InferenceSession::InferenceSession(const ModelSlot& slot, const Status& status)
     : impl_(std::make_unique<Impl>(slot, status)) {}
 
 InferenceSession::~InferenceSession() noexcept {
+  // Cancellation unwinds through this destructor; try to unload the model
+  // exactly as a normal release would so we do not leave RAM occupied until
+  // Ollama's keep_alive window expires. Failures here must not mask the
+  // original exception.
+  try {
+    release();
+  } catch (...) {
+  }
   mtrxai::signals::clear_active_ollama();
   if (impl_ && impl_->llama_server) impl_->llama_server.reset();
 }

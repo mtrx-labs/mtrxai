@@ -1,7 +1,9 @@
 #pragma once
 
 #include "mtrxai/config.hpp"
+#include "mtrxai/provider.hpp"
 
+#include <atomic>
 #include <filesystem>
 #include <functional>
 #include <string>
@@ -27,11 +29,20 @@ class Pipeline {
   using Confirm = std::function<bool(const std::string&)>;
 
   explicit Pipeline(Config& config);
+  // Runs the request on the caller's thread. status and tokens are called
+  // from that thread while it works; confirm must marshal to a thread that
+  // owns the terminal. tokens receives each streamed text chunk.
   void run(const std::string& request, const Status& status,
-           const Confirm& confirm);
+           const Confirm& confirm, const InferenceSession::TokenSink& tokens = {});
+
+  // Call from a UI thread to stop the current run cleanly: the active model
+  // request is aborted and queued stages throw Cancelled.
+  void request_cancel();
 
  private:
   Config& config_;
+  std::atomic<bool> cancelled_{false};
+  std::atomic<InferenceSession*> active_session_{nullptr};
 };
 
 }  // namespace mtrxai

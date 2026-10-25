@@ -9,12 +9,16 @@
 #include <algorithm>
 #include <cctype>
 #include <cwctype>
+#include <deque>
 #include <filesystem>
+#include <future>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace mtrxai {
@@ -110,6 +114,17 @@ std::vector<std::string> wrap_lines(const std::string& text, int width);
 
 int content_left() { return COLS >= 90 ? kSidebarWidth + 1 : 0; }
 
+// A decision screen is rare and human-paced, so it is always written back in
+// full. ncurses normally rewrites only cells whose bytes changed, so two
+// identical reviews in a row would add nothing to the terminal stream — a
+// user would not notice, but a screen reader or test replaying the byte
+// stream would see an empty screen. redrawwin tells ncurses the physical
+// screen is unknown so every cell is re-emitted on the next refresh.
+void repaint_fully() {
+  redrawwin(stdscr);
+  refresh();
+}
+
 void draw_sidebar(int bottom) {
   if (COLS < 90 || screen_config == nullptr || bottom < 5) return;
   draw_panel(0, kSidebarWidth, 3, bottom, "AGENTS");
@@ -152,11 +167,15 @@ void draw_content(const std::string& text, const std::string& panel_title) {
   const int content_height = std::max(
       0, std::min(content_bottom, LINES - 2) - content_top - 1);
   const auto lines = wrap_lines(text, std::max(1, right - left - 4));
-  for (int row = 0; row < content_height &&
-                     static_cast<std::size_t>(row) < lines.size();
-       ++row) {
+  // Show the newest lines: the transcript grows as work streams in, and on a
+  // small terminal the messages that matter (status, completion) would end up
+  // past the first screenful and never be seen.
+  const int page = std::min<int>(content_height,
+                                 static_cast<int>(lines.size()));
+  const std::size_t first = lines.size() - static_cast<std::size_t>(page);
+  for (int row = 0; row < page; ++row) {
     mvaddnstr(content_top + row + 1, left + 2,
-              lines[static_cast<std::size_t>(row)].c_str(),
+              lines[first + static_cast<std::size_t>(row)].c_str(),
               std::max(1, right - left - 2));
   }
   if (LINES >= 8) draw_panel(left, right, LINES - 4, LINES - 2, "MESSAGE");
@@ -257,6 +276,7 @@ std::string input_line(const std::string& initial = {}) {
 }
 
 bool review(const std::string& text) {
+  timeout(-1);  // decisions need blocking input; the caller re-arms the pump
   const auto lines = wrap_lines(text, std::max(1, COLS - 2));
   std::size_t offset = 0;
   const std::size_t page = static_cast<std::size_t>(std::max(1, LINES - 4));
@@ -278,7 +298,7 @@ bool review(const std::string& text) {
     attron(COLOR_PAIR(kAccent));
     mvaddnstr(LINES - 1, 1, footer.c_str(), COLS - 2);
     attroff(COLOR_PAIR(kAccent));
-    refresh();
+    repaint_fully();
 
     const int key = getch();
     if (key == 'y' || key == 'Y') return true;
@@ -523,6 +543,52 @@ void handle_command(Config& config, const std::filesystem::path& config_file,
 
 }  // namespace
 
+// Worker thread -> UI thread communication. Only the UI thread touches
+// ncurses; the worker only appends strings under the mutex.
+struct UiChannel {
+  std::mutex mutex;
+  std::deque<std::string> messages;   // status and progress lines
+  std::deque<std::string> tokens;     // streamed text chunks
+  bool review_pending = false;
+  std::string review_text;
+  std::promise<bool>* review_promise = nullptr;
+  bool done = false;
+};
+
+void push_message(UiChannel& channel, const std::string& line) {
+  std::lock_guard<std::mutex> guard(channel.mutex);
+  channel.messages.push_back(line);
+}
+
+void push_token(UiChannel& channel, const std::string& text) {
+  std::lock_guard<std::mutex> guard(channel.mutex);
+  channel.tokens.push_back(text);
+}
+
+// Runs on the worker thread: parks the proposal with the UI thread and waits
+// for the rendered decision.
+bool ask_review(UiChannel& channel, const std::string& text) {
+  std::promise<bool> promise;
+  std::future<bool> answered = promise.get_future();
+  {
+    std::lock_guard<std::mutex> guard(channel.mutex);
+    if (channel.review_pending) {
+      return false;  // defensive; never two at once
+    }
+    channel.review_pending = true;
+    channel.review_text = text;
+    channel.review_promise = &promise;
+  }
+  const bool outcome = answered.get();  // wait for the user's decision
+  {
+    std::lock_guard<std::mutex> guard(channel.mutex);
+    channel.review_pending = false;
+    channel.review_promise = nullptr;
+    channel.review_text.clear();
+  }
+  return outcome;
+}
+
 int run_tui(Config& config, const std::filesystem::path& config_file) {
   if (initscr() == nullptr) throw std::runtime_error("Could not initialize terminal UI");
   mtrxai::signals::set_curses_active(true);
@@ -555,44 +621,166 @@ int run_tui(Config& config, const std::filesystem::path& config_file) {
 
   screen_config = &config;
   Pipeline pipeline(config);
-  while (true) {
-    std::string welcome =
-        "Your coding team is ready.\n\n"
-        "Describe what you want to build. The Chief of Staff frames the task, "
-        "the Prompter creates a detailed implementation brief, and the Coder "
-        "turns it into reviewed changes.\n\n"
-        "Roles run sequentially to reduce memory use. Handoffs and progress "
-        "are saved to disk as the work proceeds.\n\n"
-        "Type a task below, or enter /help to see commands.";
-    if (config.coder.provider == "gguf" && config.coder.gguf_path.empty()) {
-      welcome += "\nCoder GGUF path is unset. Use /gguf coder /path/to/your/model.gguf "
-                 "to configure your local model.";
-    }
-    show(welcome);
-    const std::string input = input_line();
-    if (input.empty()) continue;
-    if (input == "/quit") break;
-    if (input[0] == '/') {
-      try {
-        handle_command(config, config_file, input);
-      } catch (const std::exception& error) {
-        show(std::string("Error: ") + error.what());
+  UiChannel channel;
+  std::thread worker;
+  bool running = false;
+  std::deque<std::string> transcript;
+  std::string live;
+
+  // Merge whatever the worker sent since the last redraw.
+  const auto pump = [&]() {
+    bool changed = false;
+    std::lock_guard<std::mutex> guard(channel.mutex);
+    while (!channel.messages.empty()) {
+      if (!live.empty()) {
+        transcript.push_back(live);
+        live.clear();
       }
-      getch();
+      transcript.push_back(channel.messages.front());
+      channel.messages.pop_front();
+      changed = true;
+    }
+    while (!channel.tokens.empty()) {
+      live += channel.tokens.front();
+      channel.tokens.pop_front();
+      changed = true;
+    }
+    while (transcript.size() > 500) transcript.pop_front();
+    return changed;
+  };
+  const auto redraw = [&]() {
+    std::string text;
+    for (const auto& line : transcript) text += line + "\n";
+    text += live;
+    if (live.empty()) text += "\n";
+    draw_content(text, "mtrxAI / working");
+    bool finished = false;
+    {
+      std::lock_guard<std::mutex> guard(channel.mutex);
+      finished = channel.done;
+    }
+    attron(A_DIM | COLOR_PAIR(kMuted));
+    mvaddnstr(LINES - 1, content_left() + 2,
+              finished ? "done — press Enter to start another task"
+                       : "working — Esc cancels the current job",
+              COLS - 4);
+    attroff(A_DIM | COLOR_PAIR(kMuted));
+    refresh();
+  };
+
+  while (true) {
+    if (!running) {
+      std::string welcome =
+          "Your coding team is ready.\n\n"
+          "Describe what you want to build. The Chief of Staff frames the task, "
+          "the Prompter creates a detailed implementation brief, and the Coder "
+          "turns it into reviewed changes.\n\n"
+          "Roles run sequentially to reduce memory use. Handoffs and progress "
+          "are saved to disk as the work proceeds.\n\n"
+          "Type a task below, or enter /help to see commands.";
+      if (config.coder.provider == "gguf" && config.coder.gguf_path.empty()) {
+        welcome += "\nCoder GGUF path is unset. Use /gguf coder /path/to/your/model.gguf "
+                   "to configure your local model.";
+      }
+      show(welcome);
+      const std::string input = input_line();
+      if (input.empty()) continue;
+      if (input == "/quit") break;
+      if (input[0] == '/') {
+        try {
+          handle_command(config, config_file, input);
+        } catch (const std::exception& error) {
+          show(std::string("Error: ") + error.what());
+        }
+        getch();
+        continue;
+      }
+      // Start the pipeline on a worker thread so the UI stays responsive.
+      running = true;
+      transcript.clear();
+      live.clear();
+      transcript.push_back("Working on: " + input);
+      worker = std::thread(
+          [&pipeline, &channel, input]() {
+            try {
+              pipeline.run(
+                  input,
+                  [&channel](const std::string& status_text) {
+                    push_message(channel, status_text);
+                  },
+                  [&channel](const std::string& review_text) {
+                    return ask_review(channel, review_text);
+                  },
+                  [&channel](const std::string& token) {
+                    push_token(channel, token);
+                  });
+              push_message(channel, "Finished.");
+            } catch (const Cancelled&) {
+              push_message(channel,
+                           "Cancelled. Completed stage outputs remain saved on disk.");
+            } catch (const std::exception& error) {
+              push_message(channel, std::string("Pipeline stopped: ") +
+                                        error.what() +
+                                        "\nCompleted stage outputs remain saved on disk.");
+            }
+            std::lock_guard<std::mutex> guard(channel.mutex);
+            channel.done = true;
+          });
+      timeout(100);  // pump roughly ten times a second
+    }
+
+    // Running mode: pump worker output, serve approvals, and watch for Esc.
+    timeout(100);  // pump roughly ten times a second
+    const bool changed = pump();
+    std::promise<bool>* pending = nullptr;
+    {
+      std::lock_guard<std::mutex> guard(channel.mutex);
+      if (channel.review_pending && channel.review_promise != nullptr) {
+        pending = channel.review_promise;
+        channel.review_pending = false;  // only one review at a time
+      }
+    }
+    if (pending != nullptr) {
+      const std::string review_text = [&]() {
+        std::lock_guard<std::mutex> guard(channel.mutex);
+        return channel.review_text;
+      }();
+      const bool approved = review(review_text);
+      pending->set_value(approved);
       continue;
     }
-    try {
-      pipeline.run(
-          input, [](const std::string& status) { show(status); },
-          [](const std::string& proposal) { return review(proposal); });
-      show("Pipeline complete. Press any key to enter another task.");
-    } catch (const std::exception& error) {
-      show(std::string("Pipeline stopped: ") + error.what() +
-           "\nCompleted stage outputs remain saved on disk.");
+    const int key = getch();
+    if (key == ERR) {
+      if (changed) redraw();
+      continue;
     }
-    getch();
+    bool worker_done = false;
+    {
+      std::lock_guard<std::mutex> guard(channel.mutex);
+      worker_done = channel.done;
+    }
+    if (key == 27 && !worker_done) {
+      // Esc: stop the run cleanly; the current model request aborts and the
+      // pipeline throws Cancelled at the next checkpoint.
+      pipeline.request_cancel();
+      push_message(channel, "Esc: cancelling after the current request...");
+      redraw();
+      continue;
+    }
+    if (worker_done && (key == '\n' || key == '\r' || key == KEY_ENTER)) {
+      worker.join();
+      worker = std::thread();
+      running = false;
+      continue;
+    }
+    if (changed) redraw();
   }
 
+  if (worker.joinable()) {
+    // Only reachable when quitting mid-run; ask for a clean stop first.
+    pipeline.request_cancel();
+    worker.join();
+  }
   return 0;
 }
 

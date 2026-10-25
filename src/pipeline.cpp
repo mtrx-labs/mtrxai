@@ -600,12 +600,56 @@ void save_manifest(const std::filesystem::path& session,
                json_object_to_json_string_ext(root.get(), JSON_C_TO_STRING_PRETTY));
 }
 
+// Keeps Pipeline::active_session_ pointing at the live model only while a
+// stage is generating. Clearing it from the destructor means both normal
+// completion and exceptions (cancel, network failure) leave no dangling
+// pointer behind for request_cancel() to touch.
+class ActiveSessionGuard {
+ public:
+  ActiveSessionGuard(std::atomic<InferenceSession*>& slot,
+                     InferenceSession& session)
+      : slot_(slot) {
+    slot_.store(&session);
+  }
+  ~ActiveSessionGuard() { slot_.store(nullptr); }
+
+  ActiveSessionGuard(const ActiveSessionGuard&) = delete;
+  ActiveSessionGuard& operator=(const ActiveSessionGuard&) = delete;
+
+ private:
+  std::atomic<InferenceSession*>& slot_;
+};
+
 }  // namespace
 
 Pipeline::Pipeline(Config& config) : config_(config) {}
 
+void Pipeline::request_cancel() {
+  cancelled_.store(true, std::memory_order_relaxed);
+  // The current model request also aborts mid-generation instead of finishing
+  // its remaining seconds.
+  if (auto* session = active_session_.load(std::memory_order_relaxed)) {
+    session->request_cancel();
+  }
+}
+
 void Pipeline::run(const std::string& request, const Status& status,
-                   const Confirm& confirm) {
+                   const Confirm& confirm,
+                   const InferenceSession::TokenSink& tokens) {
+  // Each run starts clean; without this, one Esc press would cancel every
+  // later run for the rest of the session.
+  cancelled_.store(false, std::memory_order_relaxed);
+  auto throw_if_cancelled = [this](const std::string& point) {
+    if (cancelled_.load(std::memory_order_relaxed)) {
+      throw Cancelled("Cancelled at " + point + ".");
+    }
+  };
+  auto wrap_tokens = [&tokens](RawRecorder& recorder, int turn) {
+    return [&, turn](const std::string& chunk) {
+      recorder.append(chunk, turn);
+      if (tokens) tokens(chunk);
+    };
+  };
   const auto root = std::filesystem::canonical(std::filesystem::current_path());
   const auto sessions = state_root();
   std::error_code error;
@@ -637,6 +681,7 @@ void Pipeline::run(const std::string& request, const Status& status,
   }
   write_atomic(session / "request.md", request);
   save_manifest(session, "request");
+  throw_if_cancelled("the start");
 
   status("Chief of Staff: " + config_.chief.model);
   // The raw stream is on disk before the stage is considered done, so a
@@ -645,8 +690,9 @@ void Pipeline::run(const std::string& request, const Status& status,
   {
     RawRecorder recorder(chief_raw_path);
     InferenceSession model(config_.chief, status);
+    ActiveSessionGuard active(active_session_, model);
     model.generate({{"system", chief_instructions()}, {"user", request}},
-                   [&recorder](const std::string& chunk) { recorder.append(chunk); });
+                   wrap_tokens(recorder, 0));
     model.release();
   }
   const std::string chief_raw = read_raw_text(chief_raw_path, 0);
@@ -664,8 +710,9 @@ void Pipeline::run(const std::string& request, const Status& status,
   {
     RawRecorder recorder(prompt_raw_path);
     InferenceSession model(config_.prompter, status);
+    ActiveSessionGuard active(active_session_, model);
     model.generate({{"system", prompter_instructions()}, {"user", prompt_input}},
-                   [&recorder](const std::string& chunk) { recorder.append(chunk); });
+                   wrap_tokens(recorder, 0));
     model.release();
   }
   const std::string prompt_raw = read_raw_text(prompt_raw_path, 0);
@@ -684,22 +731,20 @@ void Pipeline::run(const std::string& request, const Status& status,
   Messages coder_messages = {{"system", coder_instructions()},
                              {"user", coding_input}};
   InferenceSession coder_model(config_.coder, status);
+  ActiveSessionGuard active(active_session_, coder_model);
   RawRecorder coder_recorder(session / "coder" / "raw.jsonl");
   std::string coder_log = "# Coder session\n\n";
   write_atomic(session / "coder.md", coder_log);
   const int max_turns = std::clamp(config_.max_turns, 1, 500);
   for (int turn = 1; turn <= max_turns; ++turn) {
+    throw_if_cancelled("coder turn " + std::to_string(turn));
     while (coder_messages.size() > 8) {
       coder_messages.erase(coder_messages.begin() + 2,
                            coder_messages.begin() + 4);
     }
     status("Coder turn " + std::to_string(turn) + " of " + std::to_string(max_turns));
     coder_recorder.begin_group(turn);
-    coder_model.generate(
-        coder_messages,
-        [&coder_recorder, turn](const std::string& chunk) {
-          coder_recorder.append(chunk, turn);
-        });
+    coder_model.generate(coder_messages, wrap_tokens(coder_recorder, turn));
     const std::string response_raw = read_raw_text(
         session / "coder" / "raw.jsonl", turn);
     const auto response = extract_thinking(response_raw);
