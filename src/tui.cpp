@@ -8,31 +8,65 @@
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/event.hpp>
+#include <ftxui/component/mouse.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
 #include <ftxui/screen/terminal.hpp>
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <cctype>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+#include <unistd.h>
 
 namespace mtrxai {
 namespace {
 
 constexpr int kSidebarWidth = 25;
+constexpr std::size_t kClipboardLimit = 64 * 1024;
+
+std::string base64_encode(const std::string& value) {
+  static constexpr char alphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string encoded;
+  encoded.reserve(((value.size() + 2) / 3) * 4);
+  for (std::size_t offset = 0; offset < value.size(); offset += 3) {
+    const auto a = static_cast<unsigned char>(value[offset]);
+    const auto b = offset + 1 < value.size()
+                       ? static_cast<unsigned char>(value[offset + 1])
+                       : 0;
+    const auto c = offset + 2 < value.size()
+                       ? static_cast<unsigned char>(value[offset + 2])
+                       : 0;
+    const unsigned int block = (static_cast<unsigned int>(a) << 16) |
+                               (static_cast<unsigned int>(b) << 8) |
+                               static_cast<unsigned int>(c);
+    encoded.push_back(alphabet[(block >> 18) & 0x3f]);
+    encoded.push_back(alphabet[(block >> 12) & 0x3f]);
+    encoded.push_back(offset + 1 < value.size()
+                          ? alphabet[(block >> 6) & 0x3f]
+                          : '=');
+    encoded.push_back(offset + 2 < value.size() ? alphabet[block & 0x3f]
+                                                : '=');
+  }
+  return encoded;
+}
 
 // FTXUI owns the terminal and redraws the whole screen on every frame. Keeping
 // text free of control bytes still matters: model output and file contents must
@@ -87,6 +121,45 @@ struct CommandResult {
   std::string secret_role;
 };
 
+struct CommandSuggestion {
+  const char* command;
+  const char* description;
+  bool takes_arguments;
+};
+
+const std::vector<CommandSuggestion>& command_suggestions() {
+  static const std::vector<CommandSuggestion> commands = {
+      {"/model", "choose a role's provider and model", true},
+      {"/roles", "show active models and limits", false},
+      {"/sessions", "list saved sessions", false},
+      {"/endpoint", "set a provider URL", true},
+      {"/gguf", "set a local GGUF file", true},
+      {"/apikey", "enter or clear an API key", true},
+      {"/keyenv", "choose an API key environment variable", true},
+      {"/context", "set a role's context size", true},
+      {"/maxturns", "set the Coder turn limit", true},
+      {"/gguftimeout", "set the GGUF load timeout", true},
+      {"/help", "show commands and keyboard controls", false},
+      {"/quit", "exit mtrxAI", false},
+  };
+  return commands;
+}
+
+bool fuzzy_command_match(const std::string& command,
+                         const std::string& query) {
+  std::size_t position = 0;
+  for (unsigned char wanted : query) {
+    const auto found = std::find_if(
+        command.begin() + static_cast<std::ptrdiff_t>(position), command.end(),
+        [wanted](unsigned char candidate) {
+          return std::tolower(candidate) == std::tolower(wanted);
+        });
+    if (found == command.end()) return false;
+    position = static_cast<std::size_t>(found - command.begin()) + 1;
+  }
+  return true;
+}
+
 std::string roles_report(const Config& config) {
   std::ostringstream text;
   for (const auto* name : {"chief", "prompter", "coder"}) {
@@ -135,6 +208,19 @@ std::string sessions_report() {
   return text.str();
 }
 
+std::optional<SessionInfo> latest_project_session() {
+  const std::string project = std::filesystem::current_path().string();
+  for (const auto& session : list_sessions()) {
+    std::ifstream root_file(session.path / "project-root.txt");
+    std::string saved_root;
+    if (root_file && std::getline(root_file, saved_root) &&
+        saved_root == project) {
+      return session;
+    }
+  }
+  return std::nullopt;
+}
+
 std::string help_report() {
   return "Commands:\n"
          "  /roles                         show active model assignments & limits\n"
@@ -147,6 +233,10 @@ std::string help_report() {
          "  /context ROLE SIZE              set context window size (512-32768)\n"
          "  /maxturns NUMBER                set max Coder turns (1-500)\n"
          "  /gguftimeout SECONDS            set GGUF server load timeout (1-3600)\n"
+         "After a run, Enter resumes saved work or starts a same-session follow-up;\n"
+         "Ctrl+N starts a fresh task.\n"
+         "Drag across conversation text to copy it; terminal OSC 52 support is required.\n"
+         "PgUp/PgDn scrolls the conversation.\n"
          "Use Up/Down or PgUp/PgDn to review every proposed file or shell command.\n"
          "  /help                           show this help\n"
          "  /quit                           exit";
@@ -376,6 +466,11 @@ class Ui {
         config_file_(config_file),
         pipeline_(config) {
     channel_.screen = &screen_;
+    screen_.SelectionChange([this]() {
+      if (!copy_selection_after_release_) return;
+      copy_selection_after_release_ = false;
+      copy_selection_to_clipboard();
+    });
   }
 
   ~Ui() { stop_worker(); }
@@ -443,13 +538,32 @@ class Ui {
   }
 
   std::string footer_text() const {
+    const std::string scroll_help = "wheel/PgUp/PgDn scroll   drag to copy";
+    const auto with_scroll = [this, &scroll_help](const std::string& text) {
+      return text + "   " + scroll_help +
+             (clipboard_feedback_.empty() ? ""
+                                          : "   " + clipboard_feedback_);
+    };
+    if (command_palette_active()) {
+      return "↑/↓ choose command   Tab complete   Enter run   Esc clear";
+    }
     if (running_) {
-      return done_ ? "done - press Enter to start another task"
-                   : "working - Esc cancels the current job";
+      if (!done_) return with_scroll("working - Esc cancels the current job");
+      if (last_session_ && session_finished(*last_session_)) {
+        return with_scroll("done - Enter follow-up   Ctrl+N new task");
+      }
+      if (last_session_) {
+        return with_scroll("stopped - Enter resume   Ctrl+N new task");
+      }
+      return with_scroll("done - Enter to continue");
     }
     if (mode_ == Mode::notice) return "press any key to continue";
     if (mode_ == Mode::secret) return "Enter saves   Esc cancels";
-    return "Enter to send   /help commands   /quit exit";
+    if (follow_up_mode_) {
+      return with_scroll(
+          "Enter follow-up   Ctrl+N new task   /help commands   /quit exit");
+    }
+    return with_scroll("Enter to send   /help commands   /quit exit");
   }
 
   ftxui::Element render_sidebar() const {
@@ -513,6 +627,90 @@ class Ui {
            size(HEIGHT, EQUAL, 3);
   }
 
+  bool command_palette_active() const {
+    return !running_ && mode_ == Mode::prompt && !input_.empty() &&
+           input_.front() == '/' &&
+           input_.find_first_of(" \t\n") == std::string::npos;
+  }
+
+  std::vector<const CommandSuggestion*> matching_commands() const {
+    std::vector<const CommandSuggestion*> matches;
+    if (!command_palette_active()) return matches;
+    const std::string query = input_.substr(1);
+    for (const auto& suggestion : command_suggestions()) {
+      if (fuzzy_command_match(suggestion.command, query)) {
+        matches.push_back(&suggestion);
+      }
+    }
+    return matches;
+  }
+
+  void complete_selected_command() {
+    const auto matches = matching_commands();
+    if (matches.empty()) return;
+    const std::size_t selected =
+        std::min(command_selection_, matches.size() - 1);
+    const auto& suggestion = *matches[selected];
+    input_ = suggestion.command;
+    if (suggestion.takes_arguments) input_ += ' ';
+    cursor_ = input_.size();
+    command_selection_ = 0;
+  }
+
+  void move_command_selection(bool down) {
+    const auto matches = matching_commands();
+    if (matches.empty()) {
+      command_selection_ = 0;
+      return;
+    }
+    if (down) {
+      command_selection_ = (command_selection_ + 1) % matches.size();
+    } else {
+      command_selection_ = command_selection_ == 0
+                               ? matches.size() - 1
+                               : command_selection_ - 1;
+    }
+  }
+
+  ftxui::Element render_command_picker() const {
+    using namespace ftxui;
+    const auto matches = matching_commands();
+    constexpr std::size_t visible_rows = 7;
+    const std::size_t selected =
+        matches.empty() ? 0 : std::min(command_selection_, matches.size() - 1);
+    const std::size_t first =
+        selected >= visible_rows ? selected - visible_rows + 1 : 0;
+    Elements rows;
+    rows.push_back(hbox({
+        text(" COMMANDS ") | bold | color(Color::Green),
+        filler(),
+        text("↑/↓ select   Tab complete   Enter run") | dim |
+            color(Color::GrayDark),
+    }));
+    if (matches.empty()) {
+      rows.push_back(text("  No matching commands") | dim |
+                     color(Color::GrayDark));
+    } else {
+      const std::size_t end =
+          std::min(matches.size(), first + visible_rows);
+      for (std::size_t index = first; index < end; ++index) {
+        const auto& suggestion = *matches[index];
+        Element row = hbox({
+            text(index == selected ? "› " : "  "),
+            text(suggestion.command) | bold | size(WIDTH, EQUAL, 16),
+            text(suggestion.description) | dim,
+        });
+        if (index == selected) {
+          row = row | color(Color::White) | bgcolor(Color::Blue);
+        } else {
+          row = row | color(Color::GrayLight);
+        }
+        rows.push_back(std::move(row));
+      }
+    }
+    return vbox(std::move(rows)) | border;
+  }
+
   ftxui::Element render_content() const {
     using namespace ftxui;
     const auto terminal = Terminal::Size();
@@ -523,9 +721,12 @@ class Ui {
     const auto lines = wrap_lines(content_text(), inner_width);
     const std::size_t page = std::min<std::size_t>(
         static_cast<std::size_t>(inner_height), lines.size());
-    const std::size_t first = lines.size() - page;
+    const std::size_t max_scroll = lines.size() > page ? lines.size() - page : 0;
+    const std::size_t scroll = std::min(transcript_scroll_, max_scroll);
+    const std::size_t end = lines.size() - scroll;
+    const std::size_t first = end > page ? end - page : 0;
     Elements visible;
-    for (std::size_t row = 0; row < page; ++row) {
+    for (std::size_t row = 0; row < page && first + row < end; ++row) {
       const std::string& line = lines[first + row];
       visible.push_back(text(line.empty() ? " " : line));
     }
@@ -533,6 +734,50 @@ class Ui {
     return window(text(title) | bold | color(Color::Green),
                   vbox(std::move(visible)) | flex) |
            flex;
+  }
+
+  void scroll_transcript(bool toward_older) {
+    const auto terminal = ftxui::Terminal::Size();
+    const bool sidebar = terminal.dimx >= 90;
+    const int width =
+        std::max(1, terminal.dimx - (sidebar ? kSidebarWidth + 3 : 2));
+    const int height = std::max(1, terminal.dimy - 8);
+    const auto lines = wrap_lines(content_text(), width);
+    const std::size_t page = std::min<std::size_t>(
+        static_cast<std::size_t>(height), lines.size());
+    const std::size_t maximum = lines.size() > page ? lines.size() - page : 0;
+    const std::size_t amount = std::max<std::size_t>(1, page - 1);
+    if (toward_older) {
+      transcript_scroll_ = std::min(maximum, transcript_scroll_ + amount);
+    } else {
+      transcript_scroll_ = transcript_scroll_ > amount
+                               ? transcript_scroll_ - amount
+                               : 0;
+    }
+  }
+
+  void copy_selection_to_clipboard() {
+    const std::string selection = screen_.GetSelection();
+    if (selection.empty()) return;
+    if (selection.size() > kClipboardLimit) {
+      clipboard_feedback_ = "Selection is too large for terminal clipboard";
+      return;
+    }
+    const std::string sequence =
+        "\033]52;c;" + base64_encode(selection) + "\007";
+    std::size_t written = 0;
+    while (written < sequence.size()) {
+      const ssize_t count = write(STDOUT_FILENO, sequence.data() + written,
+                                  sequence.size() - written);
+      if (count < 0 && errno == EINTR) continue;
+      if (count <= 0) {
+        clipboard_feedback_ = "Could not send selection to terminal clipboard";
+        return;
+      }
+      written += static_cast<std::size_t>(count);
+    }
+    clipboard_feedback_ =
+        "Copied selection to clipboard (terminal must allow OSC 52)";
   }
 
   // Last transcript lines shown above an approval. They keep the reason for
@@ -616,6 +861,7 @@ class Ui {
     } else {
       rows.push_back(render_content() | flex);
     }
+    if (command_palette_active()) rows.push_back(render_command_picker());
     rows.push_back(render_input_panel());
     rows.push_back(hbox(
         {text(footer_text()) | dim | color(Color::GrayDark)}));
@@ -634,6 +880,7 @@ class Ui {
     }
     done_ = false;
     enter_after_done_ = false;
+    new_task_after_done_ = false;
     review_active_ = false;
     review_promise_ = nullptr;
     review_text_.clear();
@@ -665,6 +912,9 @@ class Ui {
   void start_run(std::string input) {
     transcript_.clear();
     live_.clear();
+    transcript_scroll_ = 0;
+    last_session_.reset();
+    follow_up_mode_ = false;
     task_context_ = "Working on: " + input;
     transcript_.push_back(task_context_);
     start_worker_common();
@@ -686,7 +936,10 @@ class Ui {
       const std::string saved_request = read_session_request(session);
       transcript_.clear();
       live_.clear();
+      transcript_scroll_ = 0;
       task_context_ = "Resuming session " + session.filename().string();
+      last_session_ = find_session(session.filename().string());
+      follow_up_mode_ = false;
       transcript_.push_back(task_context_);
       transcript_.push_back("Working on: " + saved_request);
       start_worker_common();
@@ -713,6 +966,55 @@ class Ui {
     }
   }
 
+  void start_follow_up(std::string request) {
+    if (!last_session_) {
+      finish_worker();
+      return;
+    }
+    const auto session = last_session_->path;
+    follow_up_mode_ = false;
+    live_.clear();
+    transcript_scroll_ = 0;
+    transcript_.push_back("Follow-up request: " + request);
+    start_worker_common();
+    worker_ = std::thread([this, session, request = std::move(request)]() {
+      run_job([this, &session, &request]() {
+        pipeline_.follow_up(
+            session, request,
+            [this](const std::string& text) { push_message(channel_, text); },
+            [this](const std::string& text) {
+              return ask_review(channel_, text);
+            },
+            [this](const std::string& text) { push_token(channel_, text); });
+      });
+    });
+  }
+
+  void prepare_follow_up_prompt() {
+    if (worker_.joinable()) worker_.join();
+    running_ = false;
+    done_ = false;
+    enter_after_done_ = false;
+    new_task_after_done_ = false;
+    follow_up_mode_ = true;
+    mode_ = Mode::prompt;
+    input_.clear();
+    cursor_ = 0;
+    transcript_.push_back("Enter a follow-up request for this session.");
+  }
+
+  void continue_after_done() {
+    if (!last_session_) {
+      finish_worker();
+    } else if (session_finished(*last_session_)) {
+      prepare_follow_up_prompt();
+    } else {
+      const auto session = last_session_->path;
+      if (worker_.joinable()) worker_.join();
+      start_resume(session);
+    }
+  }
+
   void finish_worker() {
     if (worker_.joinable()) worker_.join();
     running_ = false;
@@ -720,7 +1022,9 @@ class Ui {
     enter_after_done_ = false;
     transcript_.clear();
     live_.clear();
+    transcript_scroll_ = 0;
     task_context_.clear();
+    follow_up_mode_ = false;
     input_.clear();
     cursor_ = 0;
     mode_ = Mode::prompt;
@@ -780,10 +1084,16 @@ class Ui {
       review_promise_ = pending;
       review_offset_ = 0;
     }
-    if (done) done_ = true;
-    if (done_ && enter_after_done_) {
-      enter_after_done_ = false;
+    if (done) {
+      done_ = true;
+      last_session_ = latest_project_session();
+    }
+    if (done_ && new_task_after_done_) {
+      new_task_after_done_ = false;
       finish_worker();
+    } else if (done_ && enter_after_done_) {
+      enter_after_done_ = false;
+      continue_after_done();
     }
   }
 
@@ -844,6 +1154,7 @@ class Ui {
     std::string input = input_;
     input_.clear();
     cursor_ = 0;
+    command_selection_ = 0;
     if (input.empty()) return;
     if (input == "/quit") {
       screen_.Exit();
@@ -867,6 +1178,10 @@ class Ui {
         mode_ = Mode::notice;
         notice_ = std::string("Error: ") + error.what();
       }
+      return;
+    }
+    if (follow_up_mode_) {
+      start_follow_up(std::move(input));
       return;
     }
     start_run(std::move(input));
@@ -914,6 +1229,44 @@ class Ui {
 
   bool handle_prompt(const ftxui::Event& event) {
     using namespace ftxui;
+    if (command_palette_active()) {
+      if (event == Event::ArrowDown) {
+        move_command_selection(true);
+        return true;
+      }
+      if (event == Event::ArrowUp) {
+        move_command_selection(false);
+        return true;
+      }
+      if (event == Event::Tab) {
+        complete_selected_command();
+        return true;
+      }
+      if (event == Event::Return) {
+        const auto matches = matching_commands();
+        if (!matches.empty()) {
+          const std::size_t selected =
+              std::min(command_selection_, matches.size() - 1);
+          const auto& suggestion = *matches[selected];
+          if (input_ != suggestion.command || suggestion.takes_arguments) {
+            complete_selected_command();
+            return true;
+          }
+        }
+      }
+    }
+    if (event == Event::PageUp) {
+      scroll_transcript(true);
+      return true;
+    }
+    if (event == Event::PageDown) {
+      scroll_transcript(false);
+      return true;
+    }
+    if (follow_up_mode_ && event == Event::CtrlN) {
+      finish_worker();
+      return true;
+    }
     if (event == Event::Return) {
       submit_input();
       return true;
@@ -921,6 +1274,7 @@ class Ui {
     if (event == Event::Escape) {
       input_.clear();
       cursor_ = 0;
+      command_selection_ = 0;
       return true;
     }
     if (event == Event::Backspace) {
@@ -928,6 +1282,7 @@ class Ui {
         const std::size_t start = utf8_prev_char_start(input_, cursor_);
         input_.erase(start, cursor_ - start);
         cursor_ = start;
+        command_selection_ = 0;
       }
       return true;
     }
@@ -935,6 +1290,7 @@ class Ui {
       if (cursor_ < input_.size()) {
         const std::size_t end = utf8_next_char_end(input_, cursor_);
         input_.erase(cursor_, end - cursor_);
+        command_selection_ = 0;
       }
       return true;
     }
@@ -961,6 +1317,7 @@ class Ui {
           input_.size() + character.size() <= 8191) {
         input_.insert(cursor_, character);
         cursor_ += character.size();
+        command_selection_ = 0;
       }
       return true;
     }
@@ -969,6 +1326,14 @@ class Ui {
 
   bool handle_running(const ftxui::Event& event) {
     using namespace ftxui;
+    if (event == Event::PageUp) {
+      scroll_transcript(true);
+      return true;
+    }
+    if (event == Event::PageDown) {
+      scroll_transcript(false);
+      return true;
+    }
     if (event == Event::Escape && !done_) {
       pipeline_.request_cancel();
       if (!live_.empty()) {
@@ -979,12 +1344,20 @@ class Ui {
           "Esc: cancelling after the current request...");
       return true;
     }
-    if (event == Event::Return) {
+    if (event == Event::CtrlN) {
       if (done_) {
         finish_worker();
       } else {
-        enter_after_done_ = true;
+        new_task_after_done_ = true;
       }
+      return true;
+    }
+    if (event == Event::Return) {
+      if (!done_) {
+        enter_after_done_ = true;
+        return true;
+      }
+      continue_after_done();
       return true;
     }
     return true;
@@ -992,8 +1365,24 @@ class Ui {
 
   bool on_event(ftxui::Event event) {
     using namespace ftxui;
+    if (event.is_mouse()) {
+      if (!review_active_ && event.mouse().button == Mouse::WheelUp) {
+        scroll_transcript(true);
+        return true;
+      }
+      if (!review_active_ && event.mouse().button == Mouse::WheelDown) {
+        scroll_transcript(false);
+        return true;
+      }
+      if (event.mouse().button == Mouse::Left &&
+          event.mouse().motion == Mouse::Released) {
+        copy_selection_after_release_ = true;
+      }
+      // FTXUI's App handles unconsumed left-button events as screen selection.
+      return false;
+    }
     // SIGINT/SIGTERM only sets the process token. Stop the worker here so its
-    // destructor stops any llama-server and unloads Ollama before we exit.
+    // destructor stops any llama server and unloads Ollama before we exit.
     if (process_cancel_token().cancelled()) {
       stop_worker();
       screen_.Exit();
@@ -1001,7 +1390,14 @@ class Ui {
     }
     // Let FTXUI turn Ctrl-C / Ctrl-Z into the signals its terminal cleanup
     // already knows how to handle.
-    if (event == Event::CtrlC || event == Event::CtrlZ) return false;
+    if (event == Event::CtrlC) {
+      if (!screen_.GetSelection().empty()) {
+        copy_selection_to_clipboard();
+        return true;
+      }
+      return false;
+    }
+    if (event == Event::CtrlZ) return false;
     pump();
     if (review_active_) return handle_review(event);
     if (mode_ == Mode::notice) {
@@ -1022,12 +1418,19 @@ class Ui {
   bool running_ = false;
   bool done_ = false;
   bool enter_after_done_ = false;
+  bool new_task_after_done_ = false;
+  bool copy_selection_after_release_ = false;
+  std::size_t transcript_scroll_ = 0;
+  bool follow_up_mode_ = false;
+  std::optional<SessionInfo> last_session_;
   std::deque<std::string> transcript_;
   std::string live_;
   std::string input_;
   std::size_t cursor_ = 0;
+  std::size_t command_selection_ = 0;
   Mode mode_ = Mode::prompt;
   std::string notice_;
+  std::string clipboard_feedback_;
   std::string secret_;
   std::string secret_role_;
   bool review_active_ = false;

@@ -714,20 +714,30 @@ void Pipeline::resume(const std::filesystem::path& session,
   run_impl(session, {}, status, confirm, tokens);
 }
 
+void Pipeline::follow_up(const std::filesystem::path& session,
+                         const std::string& request, const Status& status,
+                         const Confirm& confirm,
+                         const InferenceSession::TokenSink& tokens) {
+  if (request.empty()) throw std::runtime_error("Follow-up request is empty.");
+  run_impl(session, request, status, confirm, tokens, true);
+}
+
 void Pipeline::run_impl(const std::filesystem::path& resume_session,
                         std::string request, const Status& status,
                         const Confirm& confirm,
-                        const InferenceSession::TokenSink& tokens) {
+                        const InferenceSession::TokenSink& tokens,
+                        bool follow_up) {
   RunHooks hooks;
   hooks.internal_cancel = &cancelled_;
   hooks.status = status;
   hooks.confirm = confirm;
   hooks.tokens = tokens;
-  run_impl_events(resume_session, std::move(request), hooks);
+  run_impl_events(resume_session, std::move(request), hooks, follow_up);
 }
 
 void Pipeline::run_impl_events(const std::filesystem::path& resume_session,
-                               std::string request, RunHooks& hooks) {
+                               std::string request, RunHooks& hooks,
+                               bool follow_up) {
   // Each run starts clean; without this, one Esc press would cancel every
   // later run for the rest of the session.
   cancelled_.store(false, std::memory_order_relaxed);
@@ -784,7 +794,8 @@ void Pipeline::run_impl_events(const std::filesystem::path& resume_session,
       throw std::runtime_error("Session directory does not exist: " +
                                session.string());
     }
-    request = read_session_request(session);
+    const std::string saved_request = read_session_request(session);
+    if (!follow_up) request = saved_request;
     std::string saved_root = read_text_file(session / "project-root.txt");
     while (!saved_root.empty() &&
            (saved_root.back() == '\n' || saved_root.back() == '\r')) {
@@ -796,9 +807,13 @@ void Pipeline::run_impl_events(const std::filesystem::path& resume_session,
     }
     completed_stage =
         parse_manifest_stage(read_text_file(session / "manifest.json"));
-    if (completed_stage == "finished") {
+    if (completed_stage == "finished" && !follow_up) {
       throw std::runtime_error("Session is already complete: " +
                                session.filename().string());
+    }
+    if (completed_stage == "finished" && follow_up) {
+      // Treat saved planning stages as reusable while preparing the follow-up.
+      completed_stage = "prompter";
     }
     if (stage_rank(completed_stage) == 0) {
       // A truncated manifest must not strand the session. Keep the request and
@@ -948,6 +963,14 @@ void Pipeline::run_impl_events(const std::filesystem::path& resume_session,
        saved_messages[1].role != "user")) {
     reuse_transcript = false;
   }
+  if (follow_up &&
+      (!reuse_transcript || saved_messages.empty() ||
+       saved_messages.back().role != "assistant" ||
+       parse_action(saved_messages.back().content).name != "finish")) {
+    throw std::runtime_error(
+        "Cannot continue this session: its saved Coder conversation has no "
+        "completed finish action.");
+  }
   if (resuming && !reuse_transcript) {
     hooks.log("Coder: no saved conversation to continue; starting the Coder "
            "from the saved plan.");
@@ -1027,6 +1050,24 @@ void Pipeline::run_impl_events(const std::filesystem::path& resume_session,
     message.turn = turn;
     transcript.append(message);
   };
+
+  if (follow_up) {
+    // Mark the session recoverable before appending the follow-up. If the
+    // process stops between these writes, normal resume can safely replay
+    // the existing finish action and the user can submit the follow-up again.
+    save_manifest(session, "prompter");
+    const std::string follow_up_message =
+        "Follow-up request from the user:\n" + request +
+        "\nContinue the same task and project. Use the saved conversation and "
+        "completed work as context; make only the requested follow-up changes.";
+    persist_message("user", follow_up_message, "", assistant_count);
+    saved_messages.push_back(
+        CoderMessage{"user", follow_up_message, "", assistant_count});
+    pending_assistant = false;
+    response_content.clear();
+    response_turn = 0;
+    hooks.log("Continuing the saved Coder conversation with a follow-up.");
+  }
 
   Messages coder_messages;
   std::string coder_log;

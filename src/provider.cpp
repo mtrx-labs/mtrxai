@@ -9,12 +9,14 @@
 #include <algorithm>
 #include <atomic>
 #include <arpa/inet.h>
+#include <cerrno>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
 #include <fcntl.h>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <netinet/in.h>
 #include <stdexcept>
@@ -121,6 +123,12 @@ std::size_t stream_bytes(char* data, std::size_t size, std::size_t count,
   return bytes;
 }
 
+int transfer_progress(void* destination, curl_off_t, curl_off_t,
+                      curl_off_t, curl_off_t) {
+  const auto& context = *static_cast<StreamContext*>(destination);
+  return context.cancel_requested() ? 1 : 0;
+}
+
 // Save and parse each exact response-body callback before asking curl for more.
 void post_json_stream(
     const std::string& url, const std::string& body,
@@ -148,6 +156,12 @@ void post_json_stream(
   curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stream_bytes);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context);
+  curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, transfer_progress);
+  curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &context);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+  curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+  curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 120L);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3600);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
   const CURLcode result = curl_easy_perform(curl);
@@ -155,7 +169,11 @@ void post_json_stream(
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
   if (context.error) std::rethrow_exception(context.error);
-  if (result == CURLE_WRITE_ERROR) {
+  if (result == CURLE_WRITE_ERROR || result == CURLE_ABORTED_BY_CALLBACK) {
+    if (context.cancel_requested()) throw Cancelled();
+    if (result == CURLE_ABORTED_BY_CALLBACK) {
+      throw std::runtime_error("Model request was aborted unexpectedly");
+    }
     throw Cancelled();  // the write callback aborted it
   }
   if (result != CURLE_OK) {
@@ -365,16 +383,67 @@ unsigned short available_port() {
   address.sin_port = 0;
   if (bind(socket_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
     close(socket_fd);
-    throw std::runtime_error("Could not reserve a local port for llama-server");
+    throw std::runtime_error("Could not reserve a local port for llama server");
   }
   socklen_t length = sizeof(address);
   if (getsockname(socket_fd, reinterpret_cast<sockaddr*>(&address), &length) < 0) {
     close(socket_fd);
-    throw std::runtime_error("Could not inspect the local llama-server port");
+    throw std::runtime_error("Could not inspect the local llama server port");
   }
   const auto port = ntohs(address.sin_port);
   close(socket_fd);
   return port;
+}
+
+bool supports_llama_server_subcommand() {
+  const pid_t child = fork();
+  if (child < 0) return false;
+  if (child == 0) {
+    const int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+      dup2(devnull, STDOUT_FILENO);
+      dup2(devnull, STDERR_FILENO);
+      close(devnull);
+    }
+    execlp("llama", "llama", "server", "--help", static_cast<char*>(nullptr));
+    _exit(127);
+  }
+
+  // Older llama.cpp builds may have an executable named `llama` without the
+  // `server` subcommand. Probe briefly before trying the standalone binary.
+  for (int attempt = 0; attempt < 100; ++attempt) {
+    int status = 0;
+    const pid_t result = waitpid(child, &status, WNOHANG);
+    if (result == child) return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (result < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  kill(child, SIGKILL);
+  waitpid(child, nullptr, 0);
+  return false;
+}
+
+std::string llama_log_tail(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) return {};
+  input.seekg(0, std::ios::end);
+  const std::streamoff end = static_cast<std::streamoff>(input.tellg());
+  if (end <= 0) return {};
+  constexpr std::streamoff limit = 2400;
+  const std::streamoff start = end > limit ? end - limit : 0;
+  input.seekg(start, std::ios::beg);
+  std::string tail(static_cast<std::size_t>(end - start), '\0');
+  input.read(tail.data(), static_cast<std::streamsize>(tail.size()));
+  if (!input && !input.eof()) return {};
+  tail.erase(std::remove_if(tail.begin(), tail.end(), [](unsigned char c) {
+               return (c < 0x20 && c != '\n' && c != '\r' && c != '\t') ||
+                      c == 0x7f;
+             }),
+             tail.end());
+  return tail;
 }
 
 class LlamaServer {
@@ -386,7 +455,7 @@ class LlamaServer {
     if (access(slot.gguf_path.c_str(), R_OK) != 0) {
       throw std::runtime_error("GGUF file is not readable: " + slot.gguf_path);
     }
-    const std::string role = slot.name.empty() ? "llama-server" : slot.name;
+    const std::string role = slot.name.empty() ? "llama" : slot.name;
     const auto log_file = llama_log_path(role);
     std::error_code error;
     std::filesystem::create_directories(log_file.parent_path(), error);
@@ -401,15 +470,18 @@ class LlamaServer {
       throw std::runtime_error("Could not protect logs directory: " +
                                error.message());
     }
-    status("Starting llama-server (one local model at a time)...");
+    const bool modern_cli = supports_llama_server_subcommand();
+    status(modern_cli
+               ? "Starting llama server (one local model at a time)..."
+               : "Starting legacy standalone server (one local model at a time)...");
     pid_ = fork();
-    if (pid_ < 0) throw std::runtime_error("Could not start llama-server");
+    if (pid_ < 0) throw std::runtime_error("Could not start llama server");
     if (pid_ > 0) mtrxai::signals::set_active_child(pid_);
     if (pid_ == 0) {
       if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) _exit(126);
       if (getppid() == 1) _exit(1);
 
-      // The child must never write to the terminal: llama-server is chatty
+      // The child must never write to the terminal: llama server is chatty
       // while loading and would corrupt the ncurses/FTXUI screen. Keep its
       // diagnostics in a private per-role log instead.
       const int devnull_in = open("/dev/null", O_RDONLY);
@@ -437,9 +509,17 @@ class LlamaServer {
 
       const std::string port = std::to_string(port_);
       const std::string context = std::to_string(slot.context_size);
-      execlp("llama-server", "llama-server", "--model", slot.gguf_path.c_str(),
-             "--host", "127.0.0.1", "--port", port.c_str(), "--ctx-size",
-             context.c_str(), "--n-gpu-layers", "0", static_cast<char*>(nullptr));
+      if (modern_cli) {
+        execlp("llama", "llama", "server", "--model", slot.gguf_path.c_str(),
+               "--host", "127.0.0.1", "--port", port.c_str(), "--ctx-size",
+               context.c_str(), "--device", "none", "--n-gpu-layers", "0",
+               static_cast<char*>(nullptr));
+      } else {
+        execlp("llama-server", "llama-server", "--model",
+               slot.gguf_path.c_str(), "--host", "127.0.0.1", "--port",
+               port.c_str(), "--ctx-size", context.c_str(), "--n-gpu-layers",
+               "0", static_cast<char*>(nullptr));
+      }
       _exit(127);
     }
     const std::string health_url = "http://127.0.0.1:" + std::to_string(port_) + "/health";
@@ -449,14 +529,17 @@ class LlamaServer {
       if ((cancel_ != nullptr && cancel_->cancelled()) ||
           process_cancel_token().cancelled()) {
         stop();
-        throw Cancelled("Cancelled while starting llama-server.");
+        throw Cancelled("Cancelled while starting llama server.");
       }
       int child_status = 0;
       if (waitpid(pid_, &child_status, WNOHANG) == pid_) {
         pid_ = -1;
-        throw std::runtime_error(
-            "llama-server exited before becoming ready; verify it is installed and "
-            "supports this GGUF model.");
+        std::string message =
+            "llama server exited before becoming ready; check that the runtime "
+            "supports this GGUF model.";
+        const std::string details = llama_log_tail(log_file);
+        if (!details.empty()) message += "\nRecent llama server log:\n" + details;
+        throw std::runtime_error(message);
       }
       CURL* curl = curl_easy_init();
       if (curl != nullptr) {
@@ -473,7 +556,7 @@ class LlamaServer {
       std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
     stop();
-    throw std::runtime_error("llama-server did not become ready within " +
+    throw std::runtime_error("llama server did not become ready within " +
                              std::to_string(timeout) + " seconds");
   }
 
@@ -678,7 +761,7 @@ void InferenceSession::release() {
     impl_->status("Ollama model unloaded.");
   }
   if (impl_->llama_server) {
-    impl_->status("Stopping llama-server before the next role...");
+    impl_->status("Stopping llama server before the next role...");
     impl_->llama_server.reset();
   }
   impl_->released = true;

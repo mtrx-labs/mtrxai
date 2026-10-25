@@ -305,14 +305,14 @@ def check_esc_cancellation(binary, root):
         os.write(master, b"\x1b")
         wait_for("Cancelled. Completed stage outputs remain saved on disk.")
         time.sleep(0.3)
-        os.write(master, b"\n")
+        os.write(master, b"\x0e")
         wait_for("Describe what you want to build")
         os.write(master, b"make hello.txt\n")
         output.clear()
         wait_for("Approve this exact file content?")
         os.write(master, b"y")
         wait_for("Created hello.txt.")
-        os.write(master, b"\n")
+        os.write(master, b"\x0e")
         wait_for("Describe what you want to build")
         os.write(master, b"/quit\n")
         assert drain_exit(process, master, 10) == 0
@@ -379,6 +379,7 @@ def check_resume(binary, root):
         {"action": "write_file", "path": "hello-resume.txt",
          "content": "resumed-ok\n"},
         {"action": "finish", "summary": "Created hello-resume.txt."},
+        {"action": "finish", "summary": "Follow-up checked."},
     ]
     mid_turn_answers = [
         {"action": "write_file", "path": "hello-midturn.txt",
@@ -540,7 +541,9 @@ def check_resume(binary, root):
         output.clear()
         wait_for(output, master, "Pipeline stopped:")
         wait_for(output, master, "Completed stage outputs remain saved")
-        os.write(master, b"\n")
+        # Ctrl+N explicitly starts a new task while keeping this failed
+        # session recoverable for --resume.
+        os.write(master, b"\x0e")
         wait_for(output, master, "Describe what you want to build")
         os.write(master, b"/quit\n")
         assert drain_exit(process, master, 10) == 0
@@ -574,6 +577,13 @@ def check_resume(binary, root):
         wait_for(output, master, "Created hello-resume.txt.")
         wait_for(output, master, "Finished.")
         os.write(master, b"\n")
+        wait_for(output, master, "Enter a follow-up request for this session.")
+        for character in "fix the follow-up regression\n":
+            os.write(master, character.encode())
+            time.sleep(0.05)
+        wait_for(output, master, "Follow-up checked.")
+        wait_for(output, master, "Finished.")
+        os.write(master, b"\x0e")
         wait_for(output, master, "Describe what you want to build")
         # Type the command one key at a time. Before blocking input was
         # restored after a run, the 100 ms pump timeout silently dropped
@@ -591,7 +601,7 @@ def check_resume(binary, root):
     finally:
         stop(process, master)
 
-    assert counts == {"chief": 1, "prompter": 1, "coder": 3}, counts
+    assert counts == {"chief": 1, "prompter": 1, "coder": 4}, counts
     assert (workspace / "hello-resume.txt").read_text() == "resumed-ok\n"
     manifest = json.loads((session / "manifest.json").read_text())
     assert manifest["completed_stage"] == "finished", manifest
@@ -602,13 +612,17 @@ def check_resume(binary, root):
     records = [json.loads(line)
                for line in transcript.read_text().splitlines()]
     assert [record["role"] for record in records] == [
-        "system", "user", "assistant", "user", "assistant"], records
-    assert [record.get("turn", 0) for record in records] == [0, 0, 1, 1, 2]
+        "system", "user", "assistant", "user", "assistant", "user",
+        "assistant"], records
+    assert [record.get("turn", 0) for record in records] == [0, 0, 1, 1, 2, 2, 3]
     assert records[2]["thinking"] == "Coder thinking process"
     assert json.loads(records[2]["content"])["action"] == "write_file"
     assert records[3]["content"].startswith(
         "Tool result:\nSaved hello-resume.txt")
     assert json.loads(records[4]["content"])["action"] == "finish"
+    assert records[5]["content"].startswith("Follow-up request from the user:")
+    assert "fix the follow-up regression" in records[5]["content"], records[5]
+    assert json.loads(records[6]["content"])["summary"] == "Follow-up checked."
     assert (session / "coder-turn-1.reasoning.md").read_text().strip() == \
         "Coder thinking process"
     # The finish request after resume carried the persisted tool result, so it
@@ -655,7 +669,7 @@ def check_resume(binary, root):
         assert drain_exit(process, master, 10) == 0
     finally:
         stop(process, master)
-    assert counts == {"chief": 1, "prompter": 1, "coder": 3}, counts
+    assert counts == {"chief": 1, "prompter": 1, "coder": 4}, counts
     shutil.rmtree(foreign)
 
     # Mid-turn resume: the Coder proposes a write, the process dies while the
@@ -701,14 +715,14 @@ def check_resume(binary, root):
         os.write(master, b"y")
         wait_for(output, master, "Finished: Created hello-midturn.txt.")
         wait_for(output, master, "Finished.")
-        os.write(master, b"\n")
+        os.write(master, b"\x0e")
         wait_for(output, master, "Describe what you want to build")
         os.write(master, b"/quit\n")
         assert drain_exit(process, master, 10) == 0
     finally:
         stop(process, master)
 
-    assert counts == {"chief": 2, "prompter": 2, "coder": 5}, counts
+    assert counts == {"chief": 2, "prompter": 2, "coder": 6}, counts
     assert (mid_workspace / "hello-midturn.txt").read_text() == "midturn-ok\n"
     manifest = json.loads((mid_session / "manifest.json").read_text())
     assert manifest["completed_stage"] == "finished", manifest
@@ -720,8 +734,8 @@ def check_resume(binary, root):
     assert "Saved hello-midturn.txt" in records[3]["content"]
     # The resumed run asked the model only for the turn after the re-approved
     # write; the pending write itself made no request.
-    assert len(coder_bodies) == 5, len(coder_bodies)
-    finish_messages = coder_bodies[4]["messages"]
+    assert len(coder_bodies) == 6, len(coder_bodies)
+    finish_messages = coder_bodies[5]["messages"]
     assert [message["role"] for message in finish_messages] == [
         "user", "assistant", "user"], finish_messages
     assert "hello-midturn" in finish_messages[2]["content"]
@@ -740,7 +754,7 @@ def check_resume(binary, root):
     try:
         wait_for(output, master, "Finished: Created hello-midturn.txt.")
         assert counts["coder"] == coder_calls_before_finish
-        os.write(master, b"\n")
+        os.write(master, b"\x0e")
         wait_for(output, master, "Describe what you want to build")
         os.write(master, b"/quit\n")
         assert drain_exit(process, master, 10) == 0
@@ -765,7 +779,7 @@ def check_resume(binary, root):
         wait_for(output, master, "Pipeline stopped:")
         wait_for(output, master, "not valid actions")
         wait_for(output, master, "Completed stage outputs remain saved")
-        os.write(master, b"\n")
+        os.write(master, b"\x0e")
         wait_for(output, master, "Describe what you want to build")
         os.write(master, b"/quit\n")
         assert drain_exit(process, master, 10) == 0
@@ -826,7 +840,7 @@ def check_resume(binary, root):
         wait_for(output, master, "Approve this exact file content?")
         os.write(master, b"y")
         wait_for(output, master, "Finished: Created hello-bad.txt.")
-        os.write(master, b"\n")
+        os.write(master, b"\x0e")
         wait_for(output, master, "Describe what you want to build")
         os.write(master, b"/quit\n")
         assert drain_exit(process, master, 10) == 0
@@ -876,7 +890,7 @@ def check_resume(binary, root):
         wait_for(output, master, "Pipeline stopped:")
         wait_for(output, master, "not valid actions")
         wait_for(output, master, "Completed stage outputs remain saved")
-        os.write(master, b"\n")
+        os.write(master, b"\x0e")
         wait_for(output, master, "Describe what you want to build")
         os.write(master, b"/quit\n")
         assert drain_exit(process, master, 10) == 0
@@ -922,7 +936,7 @@ def check_resume(binary, root):
         wait_for(output, master, "Approve this exact file content?")
         os.write(master, b"y")
         wait_for(output, master, "Finished: Created hello-saved.txt.")
-        os.write(master, b"\n")
+        os.write(master, b"\x0e")
         wait_for(output, master, "Describe what you want to build")
         os.write(master, b"/quit\n")
         assert drain_exit(process, master, 10) == 0
@@ -945,7 +959,7 @@ def check_resume(binary, root):
     assert "Your previous reply was rejected" in \
         retry_messages[-1]["content"]
 
-    assert counts == {"chief": 3, "prompter": 3, "coder": 12}, counts
+    assert counts == {"chief": 3, "prompter": 3, "coder": 13}, counts
 
     server.shutdown()
 
@@ -1233,6 +1247,11 @@ def run(binary):
     }
     llama_bin = temp / "bin"
     llama_bin.mkdir()
+    # Force the compatibility path even when the host running the test has a
+    # newer `llama server` command on PATH.
+    llama_probe = llama_bin / "llama"
+    llama_probe.write_text("#!/bin/sh\nexit 1\n")
+    llama_probe.chmod(0o755)
     llama_executable = llama_bin / "llama-server"
     shutil.copyfile(Path(__file__).with_name("mock_llama_server.py"), llama_executable)
     llama_executable.chmod(llama_executable.stat().st_mode | stat.S_IXUSR)
@@ -1317,7 +1336,7 @@ def run(binary):
         os.write(master, b"n")
         output.clear()
         wait_for("Created generated.txt and verified it with printf.")
-        os.write(master, b"\n")
+        os.write(master, b"\x0e")
         output.clear()
         wait_for("Describe what you want to build")
         os.write(master, b"/quit\n")

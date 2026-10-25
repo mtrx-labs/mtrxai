@@ -10,7 +10,7 @@ starting the next model, and asks before applying the Coder's proposed files.
 Only one local inference is active at a time. Ollama keeps a role loaded across
 its turns, then mtrxAI explicitly unloads it before starting the next role.
 Chief and Prompter default to a 4096-token context; Coder defaults to 2048. A
-`.gguf` role is served by one short-lived `llama-server` process for its whole
+`.gguf` role is served by one short-lived `llama server` process for its whole
 stage, then stopped before the next role. The request, Chief brief, detailed
 prompt, Coder responses, and manifest are saved under
 `~/.local/state/mtrxai/sessions/<timestamp>/` (or `$XDG_STATE_HOME`). A failure
@@ -91,11 +91,14 @@ runtime dependencies; per-user configuration, API credentials, and session
 history are stored in the user's home directories and are not removed during
 package upgrades or uninstallation.
 
-Install `llama-server` from [llama.cpp](https://github.com/ggml-org/llama.cpp)
-for GGUF inference and pull any configured Ollama models before using them.
+Install llama.cpp from [llama.cpp](https://github.com/ggml-org/llama.cpp) for
+GGUF inference. mtrxAI checks for the `llama server` subcommand first, then
+falls back to the standalone `llama-server` command used by older builds. Pull
+any configured Ollama models before using them.
 The GGUF server uses the role's `context_size` (2048 tokens for the Coder) and
-explicitly disables GPU layers. Lower a role's `context_size` in the config if
-memory pressure requires it; increase it only when there is RAM headroom.
+currently runs on the CPU without GPU offload. Lower a role's `context_size` in
+the config if memory pressure requires it; increase it only when there is RAM
+headroom.
 
 ## Providers and hot swapping
 
@@ -116,7 +119,7 @@ Edit `~/.config/mtrxai/config.json` or use TUI commands:
 ```
 
 `/context` sets a role's context window in tokens (512-32768). `/maxturns` sets
-the Coder turn limit (1-500). `/gguftimeout` sets how long llama-server may take
+the Coder turn limit (1-500). `/gguftimeout` sets how long llama server may take
 to load a GGUF model before mtrxAI gives up (1-3600 seconds). The same values
 are stored in `config.json` as top-level `max_turns` and
 `gguf_load_timeout_seconds`, per-slot `context_size`, and per-slot
@@ -128,7 +131,7 @@ endpoint or `anthropic` for Anthropic's native Messages API. Both support
 `credentials.json`. `/apikey ROLE` lets you securely enter or clear a key from
 inside the TUI after switching providers. A locally running llama.cpp server
 can also be used as an OpenAI-compatible endpoint. For direct GGUF use, install
-`llama-server`; mtrxAI starts it for the Coder stage and terminates it afterward.
+`llama server`; mtrxAI starts it for the Coder stage and terminates it afterward.
 
 Verified Ollama tags (checked against the Ollama library in October 2026):
 
@@ -190,7 +193,7 @@ transcript pane follows the newest output as it grows. Model `<think>...</think>
 roles to prevent context pollution, and reasoning is saved in separate session
 artifacts (`chief.reasoning.md`, `prompt.reasoning.md`,
 `coder_turn_<N>_thinking.md`).
-When running local GGUF models, `llama-server` stdout and stderr are
+When running local GGUF models, llama server stdout and stderr are
 redirected to `$XDG_STATE_HOME/mtrxai/logs/<role>.log` (mode 0600) to keep the TUI
 display clean. Signal handlers for SIGINT and SIGTERM cleanly terminate child
 processes and unload active Ollama models; the TUI restores the terminal and

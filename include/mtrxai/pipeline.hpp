@@ -36,6 +36,11 @@ class Pipeline {
   void resume(const std::filesystem::path& session, const Status& status,
               const Confirm& confirm,
               const InferenceSession::TokenSink& tokens = {});
+  // Continues a completed Coder conversation with a new user instruction.
+  void follow_up(const std::filesystem::path& session,
+                 const std::string& request, const Status& status,
+                 const Confirm& confirm,
+                 const InferenceSession::TokenSink& tokens = {});
 
   // Call from a UI thread to stop the current run cleanly: the active model
   // request is aborted and queued stages throw Cancelled.
@@ -46,9 +51,11 @@ class Pipeline {
   void run_impl(const std::filesystem::path& resume_session,
                 std::string request, const Status& status,
                 const Confirm& confirm,
-                const InferenceSession::TokenSink& tokens);
+                const InferenceSession::TokenSink& tokens,
+                bool follow_up = false);
   void run_impl_events(const std::filesystem::path& resume_session,
-                       std::string request, RunHooks& hooks);
+                       std::string request, RunHooks& hooks,
+                       bool follow_up = false);
 
   Config& config_;
   std::atomic<bool> cancelled_{false};
