@@ -1,6 +1,13 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <filesystem>
+#include <fstream>
+
+#include "mtrxai/files.hpp"
 #include "mtrxai/pipeline.hpp"
 #include "mtrxai/provider.hpp"
 #include "mtrxai/signals.hpp"
@@ -231,4 +238,34 @@ TEST_CASE("Anthropic delta parser reads text_delta events") {
   CHECK(mtrxai::stream::anthropic_delta_text(
             "{\"type\":\"content_block_delta\","
             "\"delta\":{\"type\":\"input_json_delta\"}}") == "");
+}
+
+TEST_CASE("RawRecorder persists chunks and read_raw_text filters by turn") {
+  const auto dir = std::filesystem::temp_directory_path() /
+                   ("mtrxai_raw_test_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(dir);
+  const auto path = dir / "stage" / "raw.jsonl";
+  {
+    mtrxai::RawRecorder recorder(path);
+    recorder.append("hel", 0);
+    recorder.begin_group(1);
+    recorder.append("lo ", 1);
+    recorder.append("wor", 1);
+  }
+  // Owner-only permissions were applied at creation.
+  const auto mode = std::filesystem::status(path).permissions();
+  CHECK((mode & std::filesystem::perms::group_all) == std::filesystem::perms::none);
+  CHECK((mode & std::filesystem::perms::others_all) == std::filesystem::perms::none);
+  // Whole-file decode; the start marker contributes no text.
+  CHECK(mtrxai::read_raw_text(path) == "hello wor");
+  CHECK(mtrxai::read_raw_text(path, 0) == "hel");
+  CHECK(mtrxai::read_raw_text(path, 1) == "lo wor");
+  // A malformed line is ignored rather than corrupting the stream.
+  {
+    std::ofstream extra(path, std::ios::app);
+    extra << "not json\n";
+    extra << R"({"type":"token","turn":1,"text":"!"})" << "\n";
+  }
+  CHECK(mtrxai::read_raw_text(path, 1) == "lo wor!");
+  std::filesystem::remove_all(dir);
 }

@@ -514,6 +514,34 @@ def run(binary):
         assert (session / "chief.md").exists()
         assert (session / "chief_thinking.md").exists()
         assert (session / "chief_thinking.md").read_text().strip() == "Chief thinking process"
+        # Raw streams: tokens persisted verbatim before the derived artifacts.
+        for stage in ("chief", "prompt", "coder"):
+            raw_file = session / stage / "raw.jsonl"
+            assert raw_file.exists(), f"Missing raw stream {raw_file}"
+            assert stat.S_IMODE(raw_file.stat().st_mode) == 0o600
+        chief_raw_lines = [
+            json.loads(line)
+            for line in
+            (session / "chief" / "raw.jsonl").read_text().splitlines()
+        ]
+        assert all(entry["type"] == "token" for entry in chief_raw_lines)
+        chief_raw_text = "".join(entry["text"] for entry in chief_raw_lines)
+        assert "Chief thinking process" in chief_raw_text
+        assert chief_raw_text.endswith(
+            "Chief brief: create and verify a generated file.")
+        # Last Coder turn raw content matches the finish action in coder.md.
+        coder_raw_lines = [
+            json.loads(line)
+            for line in
+            (session / "coder" / "raw.jsonl").read_text().splitlines()
+        ]
+        assert coder_raw_lines[0]["type"] == "start"
+        assert coder_raw_lines[0]["turn"] == 1
+        final_turn = coder_raw_lines[-1]["turn"]
+        final_text = "".join(
+            entry["text"] for entry in coder_raw_lines
+            if entry["type"] == "token" and entry["turn"] == final_turn)
+        assert json.loads(final_text)["action"] == "finish"
         assert "<think>" not in (session / "chief.md").read_text()
         assert (session / "prompt.md").exists()
         coder_log = (session / "coder.md").read_text()

@@ -160,8 +160,12 @@ are checked against traversal and symlink escapes. Replaced files are backed
 up in the private session folder. Generated commands are not run automatically.
 
 mtrxAI saves the Chief and Prompter handoffs and each Coder turn before moving
-on. The Coder gets a bounded project-file listing and inspects relevant source
-on demand. Each model role configures `max_tokens` (`num_predict` in Ollama).
+on. Every stage additionally records its streamed tokens verbatim in
+`<session>/<stage>/raw.jsonl` (owner-only, flushed as chunks arrive, fsynced
+about once a second); the derived stage files such as `chief.md` are written
+afterwards from that recording, so a killed run still leaves enough state to
+rebuild the stage. The Coder gets a bounded project-file listing and inspects
+relevant source on demand. Each model role configures `max_tokens` (`num_predict` in Ollama).
 Generation requests stream: Ollama uses its native NDJSON stream while
 OpenAI-compatible endpoints and Anthropic use SSE, so replies arrive as
 incremental chunks and a request can be aborted mid-stream instead of waiting

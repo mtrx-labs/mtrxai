@@ -639,12 +639,17 @@ void Pipeline::run(const std::string& request, const Status& status,
   save_manifest(session, "request");
 
   status("Chief of Staff: " + config_.chief.model);
-  std::string chief_raw;
+  // The raw stream is on disk before the stage is considered done, so a
+  // resume can rebuild it; chief.md is derived from that recording.
+  const auto chief_raw_path = session / "chief" / "raw.jsonl";
   {
+    RawRecorder recorder(chief_raw_path);
     InferenceSession model(config_.chief, status);
-    chief_raw = model.generate({{"system", chief_instructions()}, {"user", request}});
+    model.generate({{"system", chief_instructions()}, {"user", request}},
+                   [&recorder](const std::string& chunk) { recorder.append(chunk); });
     model.release();
   }
+  const std::string chief_raw = read_raw_text(chief_raw_path, 0);
   const auto chief = extract_thinking(chief_raw);
   if (!chief.thinking.empty()) {
     write_atomic(session / "chief_thinking.md", chief.thinking);
@@ -655,13 +660,15 @@ void Pipeline::run(const std::string& request, const Status& status,
   const std::string prompt_input = "Original user request:\n" + request +
                                    "\n\nChief of Staff brief:\n" + chief.content;
   status("Prompter: " + config_.prompter.model);
-  std::string prompt_raw;
+  const auto prompt_raw_path = session / "prompt" / "raw.jsonl";
   {
+    RawRecorder recorder(prompt_raw_path);
     InferenceSession model(config_.prompter, status);
-    prompt_raw = model.generate(
-        {{"system", prompter_instructions()}, {"user", prompt_input}});
+    model.generate({{"system", prompter_instructions()}, {"user", prompt_input}},
+                   [&recorder](const std::string& chunk) { recorder.append(chunk); });
     model.release();
   }
+  const std::string prompt_raw = read_raw_text(prompt_raw_path, 0);
   const auto prompt = extract_thinking(prompt_raw);
   if (!prompt.thinking.empty()) {
     write_atomic(session / "prompt_thinking.md", prompt.thinking);
@@ -677,6 +684,7 @@ void Pipeline::run(const std::string& request, const Status& status,
   Messages coder_messages = {{"system", coder_instructions()},
                              {"user", coding_input}};
   InferenceSession coder_model(config_.coder, status);
+  RawRecorder coder_recorder(session / "coder" / "raw.jsonl");
   std::string coder_log = "# Coder session\n\n";
   write_atomic(session / "coder.md", coder_log);
   const int max_turns = std::clamp(config_.max_turns, 1, 500);
@@ -686,7 +694,14 @@ void Pipeline::run(const std::string& request, const Status& status,
                            coder_messages.begin() + 4);
     }
     status("Coder turn " + std::to_string(turn) + " of " + std::to_string(max_turns));
-    const std::string response_raw = coder_model.generate(coder_messages);
+    coder_recorder.begin_group(turn);
+    coder_model.generate(
+        coder_messages,
+        [&coder_recorder, turn](const std::string& chunk) {
+          coder_recorder.append(chunk, turn);
+        });
+    const std::string response_raw = read_raw_text(
+        session / "coder" / "raw.jsonl", turn);
     const auto response = extract_thinking(response_raw);
     coder_messages.emplace_back("assistant", response.content);
     coder_log += "## Turn " + std::to_string(turn) + "\n\n";
