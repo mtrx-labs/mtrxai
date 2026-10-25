@@ -165,7 +165,12 @@ on. Every stage additionally records its streamed tokens verbatim in
 `<session>/<stage>/raw.jsonl` (owner-only, flushed as chunks arrive, fsynced
 about once a second); the derived stage files such as `chief.md` are written
 afterwards from that recording, so a killed run still leaves enough state to
-rebuild the stage. The Coder gets a bounded project-file listing and inspects
+rebuild the stage. The Coder also writes an append-only transcript at
+`<session>/coder/messages.jsonl`: one owner-only, fsynced JSON line per message
+in the Coder context, including the exact tool-result text; assistant reasoning
+is stored separately. The manifest tracks progress, but the transcript is what
+resume trusts for the Coder, because a process can die between a model reply
+and the action it requested. The Coder gets a bounded project-file listing and inspects
 relevant source on demand. Each model role configures `max_tokens` (`num_predict` in Ollama).
 Generation requests stream: Ollama uses its native NDJSON stream while
 OpenAI-compatible endpoints and Anthropic use SSE, so replies arrive as
@@ -196,10 +201,15 @@ starts immediately.
 Resume reuses the saved Chief and Prompter output instead of loading those
 models again, so a failure later in the pipeline does not repeat earlier work.
 The session records the project directory it belongs to, and resume refuses to
-run from a different directory. If the Coder had already started, its unfinished
-attempt is kept as `coder.before-resume-<timestamp>` and the Coder begins again
-from the saved plan. A session whose manifest says `finished` is reported as
-complete without starting any model.
+run from a different directory. The Coder conversation is rebuilt from
+`coder/messages.jsonl` and continues at the next turn, so a failure while the
+Coder waits for approval does not repeat the model call. If the last saved reply
+requested an action that had not run yet, resume shows it for approval again;
+file writes and commands are never replayed automatically. A saved `finish`
+action completes the session without loading a model. Sessions written before
+transcripts existed keep their old Coder attempt as
+`coder.before-resume-<timestamp>` and start the Coder again. A session whose
+manifest says `finished` is reported as complete without starting any model.
 
 ## License
 

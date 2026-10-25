@@ -1,5 +1,6 @@
 #include "mtrxai/pipeline.hpp"
 
+#include "mtrxai/coder_transcript.hpp"
 #include "mtrxai/files.hpp"
 #include "mtrxai/provider.hpp"
 #include "mtrxai/session.hpp"
@@ -828,137 +829,290 @@ void Pipeline::run_impl(const std::filesystem::path& resume_session,
     prompt_content = prompt.content;
   }
 
-  // This version has no structured Coder transcript yet, so a coder that was
-  // already running cannot continue mid-turn. Keep its old log (it may explain
-  // the failure) and let the Coder start over in the same session.
-  if (resuming) move_aside(session / "coder");
+  // The Coder conversation is persisted message by message, including the
+  // exact user wrapper around each tool result. A manifest stage alone cannot
+  // tell whether an assistant reply was already produced, because the process
+  // can die between the model reply and the tool result; the transcript can.
+  const auto coder_raw_path = session / "coder" / "raw.jsonl";
+  const auto coder_transcript_path = session / "coder" / "messages.jsonl";
+  std::vector<CoderMessage> saved_messages =
+      CoderTranscript::load(coder_transcript_path);
 
-  const std::string coding_input =
-      "Original user request:\n" + request + "\n\nDetailed implementation prompt:\n" +
-      prompt_content + "\n\n" + workspace_snapshot(root);
-  status("Coder: " + (config_.coder.model.empty() ? config_.coder.gguf_path
-                                                   : config_.coder.model));
-  Messages coder_messages = {{"system", coder_instructions()},
-                             {"user", coding_input}};
-  InferenceSession coder_model(config_.coder, status);
-  ActiveSessionGuard active(active_session_, coder_model);
-  RawRecorder coder_recorder(session / "coder" / "raw.jsonl");
-  std::string coder_log = "# Coder session\n\n";
-  write_atomic(session / "coder.md", coder_log);
-  const int max_turns = std::clamp(config_.max_turns, 1, 500);
-  for (int turn = 1; turn <= max_turns; ++turn) {
-    throw_if_cancelled("coder turn " + std::to_string(turn));
-    while (coder_messages.size() > 8) {
-      coder_messages.erase(coder_messages.begin() + 2,
-                           coder_messages.begin() + 4);
+  // Reuse a transcript only for the plan it was generated from. If the Chief
+  // or the Prompter had to run again (for example after a damaged manifest),
+  // or the session predates transcripts, set the old Coder attempt aside and
+  // start over. The old files remain for inspection.
+  bool reuse_transcript =
+      resuming && !saved_messages.empty() && chief_saved && prompter_saved;
+  if (reuse_transcript &&
+      (saved_messages.size() < 2 || saved_messages[0].role != "system" ||
+       saved_messages[1].role != "user")) {
+    reuse_transcript = false;
+  }
+  if (resuming && !reuse_transcript) {
+    status("Coder: no saved conversation to continue; starting the Coder "
+           "from the saved plan.");
+    move_aside(session / "coder");
+    move_aside(session / "coder.md");
+    saved_messages.clear();
+  }
+
+  // A saved assistant message means the model reply was durable but its action
+  // was not recorded as a tool result. That action is processed again, and any
+  // write or command still goes through the normal approval prompt. A saved
+  // finish just completes the session without loading a model at all.
+  bool pending_assistant =
+      reuse_transcript && saved_messages.back().role == "assistant";
+  const int assistant_count = static_cast<int>(std::count_if(
+      saved_messages.begin(), saved_messages.end(),
+      [](const CoderMessage& message) {
+        return message.role == "assistant";
+      }));
+  std::string response_content;
+  int response_turn = 0;
+  if (pending_assistant) {
+    response_content = saved_messages.back().content;
+    // Older transcripts may not have a turn field; the last assistant reply
+    // belongs to the most recent generated turn.
+    response_turn = saved_messages.back().turn > 0
+                        ? saved_messages.back().turn
+                        : std::max(1, assistant_count);
+  }
+
+  CoderTranscript transcript(coder_transcript_path);
+  auto persist_message = [&transcript](const std::string& role,
+                                       const std::string& content,
+                                       const std::string& thinking, int turn) {
+    CoderMessage message;
+    message.role = role;
+    message.content = content;
+    message.thinking = thinking;
+    message.turn = turn;
+    transcript.append(message);
+  };
+
+  Messages coder_messages;
+  std::string coder_log;
+  if (reuse_transcript) {
+    for (const auto& message : saved_messages) {
+      coder_messages.emplace_back(message.role, message.content);
     }
-    status("Coder turn " + std::to_string(turn) + " of " + std::to_string(max_turns));
-    coder_recorder.begin_group(turn);
-    coder_model.generate(coder_messages, wrap_tokens(coder_recorder, turn));
-    const std::string response_raw = read_raw_text(
-        session / "coder" / "raw.jsonl", turn);
-    const auto response = extract_thinking(response_raw);
-    coder_messages.emplace_back("assistant", response.content);
-    coder_log += "## Turn " + std::to_string(turn) + "\n\n";
-    if (!response.thinking.empty()) {
-      coder_log += "### Thinking\n\n" + response.thinking + "\n\n";
-      write_atomic(session / ("coder_turn_" + std::to_string(turn) + "_thinking.md"),
-                   response.thinking);
-    }
-    coder_log += "### Coder response\n\n" + response.content + "\n\n";
+    coder_log = read_text_file(session / "coder.md");
+    if (coder_log.empty()) coder_log = "# Coder session\n\n";
+    // Keep the human-readable log continuous, and make the resume visible.
+    coder_log += "\n## Resumed\n\n";
     write_atomic(session / "coder.md", coder_log);
-    save_manifest(session, "coder-turn-" + std::to_string(turn));
+    status("Coder: loaded " + std::to_string(saved_messages.size()) +
+           " saved messages; continuing at turn " +
+           std::to_string(assistant_count + 1) + ".");
+  } else {
+    const std::string coding_input =
+        "Original user request:\n" + request +
+        "\n\nDetailed implementation prompt:\n" + prompt_content + "\n\n" +
+        workspace_snapshot(root);
+    coder_messages = {{"system", coder_instructions()},
+                      {"user", coding_input}};
+    persist_message("system", coder_instructions(), "", 0);
+    persist_message("user", coding_input, "", 0);
+    coder_log = "# Coder session\n\n";
+    write_atomic(session / "coder.md", coder_log);
+  }
 
+  if (pending_assistant) {
+    status("Coder: saved turn " + std::to_string(response_turn) +
+           " has an action that was not applied yet; asking again.");
+    // The assistant reply is durable but the tool result is not. There is no
+    // unfinished generation to protect, so keep raw.jsonl; the next generated
+    // turn gets a new turn number.
+  } else if (reuse_transcript) {
+    // The last saved message is a user message, so a generation may have been
+    // interrupted before its assistant reply was recorded. RawRecorder appends
+    // and read_raw_text selects by turn, so the abandoned partial answer would
+    // otherwise be glued to the regenerated one.
+    move_aside(coder_raw_path);
+  }
+
+  const int max_turns = std::clamp(config_.max_turns, 1, 500);
+
+  auto execute_action = [&](const CoderAction& action,
+                            int turn) -> std::string {
+    if (action.name == "list_files") {
+      const auto relative =
+          action.path.empty() ? std::filesystem::path(".")
+                              : std::filesystem::path(action.path);
+      return "Project files:\n" + list_files(root, relative);
+    }
+    if (action.name == "read_file") {
+      if (action.path.empty()) {
+        throw std::runtime_error("read_file requires a relative path.");
+      }
+      return "Contents of " + action.path + ":\n" +
+             read_file(root, action.path, action.offset);
+    }
+    if (action.name == "write_file") {
+      if (action.path.empty()) {
+        throw std::runtime_error("write_file requires a relative path.");
+      }
+      const std::filesystem::path relative(action.path);
+      if (action.content.size() > 2 * 1024 * 1024) {
+        throw std::runtime_error("File exceeds the 2 MiB write limit.");
+      }
+      if (sensitive_filename(relative.filename().string())) {
+        throw std::runtime_error("Refusing to write a sensitive file path: " +
+                                 action.path);
+      }
+      const auto target = checked_target(root, relative);
+      if (std::filesystem::exists(target) &&
+          !std::filesystem::is_regular_file(target)) {
+        throw std::runtime_error("Refusing to replace a non-file: " +
+                                 action.path);
+      }
+      std::ostringstream review;
+      review << "Coder requests this file write:\nPath: " << action.path
+             << "\nSize: " << action.content.size() << " bytes\n\n"
+             << action.content
+             << "\n\nApprove this exact file content?";
+      if (confirm(review.str())) {
+        return write_file(root, session, action.path, action.content, turn);
+      }
+      return "User declined this file write. The file was not changed.";
+    }
+    if (action.name == "run_command") {
+      if (action.command.empty()) {
+        throw std::runtime_error("run_command requires a command.");
+      }
+      const int timeout = std::clamp(action.timeout_seconds, 1, 300);
+      std::ostringstream review;
+      review << "Coder requests shell execution:\nCommand: " << action.command
+             << "\nTimeout: " << timeout << " seconds\n"
+             << "Working directory: project root\n\n"
+             << "Approve this exact command?";
+      if (confirm(review.str())) {
+        return run_command(root, action.command, timeout);
+      }
+      return "User declined this command. It was not executed.";
+    }
+    throw std::runtime_error("Unsupported coder action: " + action.name);
+  };
+
+  // The model is loaded when the first reply must be generated, not when a
+  // saved turn still needs an action. In particular, a pending finish resumes
+  // without loading a model at all.
+  std::unique_ptr<InferenceSession> coder_model;
+  std::unique_ptr<ActiveSessionGuard> active;
+  auto ensure_model = [&]() -> InferenceSession& {
+    if (!coder_model) {
+      status("Coder: " + (config_.coder.model.empty() ? config_.coder.gguf_path
+                                                       : config_.coder.model));
+      coder_model = std::make_unique<InferenceSession>(config_.coder, status);
+      active =
+          std::make_unique<ActiveSessionGuard>(active_session_, *coder_model);
+    }
+    return *coder_model;
+  };
+  std::unique_ptr<RawRecorder> coder_recorder;
+  auto ensure_recorder = [&]() -> RawRecorder& {
+    if (!coder_recorder) {
+      coder_recorder = std::make_unique<RawRecorder>(coder_raw_path);
+    }
+    return *coder_recorder;
+  };
+
+  int next_turn = assistant_count + 1;
+  while (true) {
+    throw_if_cancelled("coder turn " +
+                       std::to_string(pending_assistant ? response_turn
+                                                        : next_turn));
+
+    if (!pending_assistant) {
+      if (next_turn > max_turns) {
+        save_manifest(session, "turn-limit");
+        throw std::runtime_error(
+            "Coder reached the " + std::to_string(max_turns) +
+            "-turn limit. Its work log is saved at " +
+            (session / "coder.md").string());
+      }
+      // Keep the system prompt and the initial request, then the most recent
+      // six messages. Both a fresh run and a resumed one are trimmed here, so
+      // small context windows get the same window either way.
+      while (coder_messages.size() > 8) {
+        coder_messages.erase(coder_messages.begin() + 2,
+                             coder_messages.begin() + 4);
+      }
+      status("Coder turn " + std::to_string(next_turn) + " of " +
+             std::to_string(max_turns));
+      RawRecorder& recorder = ensure_recorder();
+      recorder.begin_group(next_turn);
+      InferenceSession& model = ensure_model();
+      model.generate(coder_messages, wrap_tokens(recorder, next_turn));
+
+      const std::string response_raw =
+          read_raw_text(coder_raw_path, next_turn);
+      const auto response = extract_thinking(response_raw);
+      response_content = response.content;
+      response_turn = next_turn;
+
+      // This append is the commit point. If the process dies after it, resume
+      // knows the reply exists and will not ask the model for it again.
+      persist_message("assistant", response.content, response.thinking,
+                      response_turn);
+      coder_messages.emplace_back("assistant", response.content);
+      coder_log += "## Turn " + std::to_string(response_turn) + "\n\n";
+      if (!response.thinking.empty()) {
+        coder_log += "### Thinking\n\n" + response.thinking + "\n\n";
+        write_atomic(session / ("coder_turn_" +
+                                std::to_string(response_turn) + "_thinking.md"),
+                     response.thinking);
+      }
+      coder_log += "### Coder response\n\n" + response.content + "\n\n";
+      write_atomic(session / "coder.md", coder_log);
+      save_manifest(session, "coder-turn-" +
+                                 std::to_string(response_turn));
+      pending_assistant = true;
+      ++next_turn;
+    }
+
+    // A fresh reply and one loaded from disk take exactly the same path from
+    // here: parse the stored action, ask before side effects, record the
+    // result. A resumed approval is a new approval, never a replay.
     std::string tool_result;
     try {
-      const CoderAction action = parse_action(response.content);
+      const CoderAction action = parse_action(response_content);
       if (action.name == "finish") {
-        tool_result = action.summary.empty() ? "Coder finished." : action.summary;
+        tool_result =
+            action.summary.empty() ? "Coder finished." : action.summary;
         coder_log += "### Finished\n\n" + tool_result + "\n";
         write_atomic(session / "coder.md", coder_log);
         save_manifest(session, "finished");
-        coder_model.release();
+        if (coder_model) coder_model->release();
         status("Finished: " + tool_result + "\nSession artifacts: " +
                session.string());
         return;
       }
-      if (action.name == "list_files") {
-        const auto relative =
-            action.path.empty() ? std::filesystem::path(".")
-                                : std::filesystem::path(action.path);
-        tool_result = "Project files:\n" + list_files(root, relative);
-      } else if (action.name == "read_file") {
-        if (action.path.empty()) {
-          throw std::runtime_error("read_file requires a relative path.");
-        }
-        tool_result = "Contents of " + action.path + ":\n" +
-                      read_file(root, action.path, action.offset);
-      } else if (action.name == "write_file") {
-        if (action.path.empty()) {
-          throw std::runtime_error("write_file requires a relative path.");
-        }
-        const std::filesystem::path relative(action.path);
-        if (action.content.size() > 2 * 1024 * 1024) {
-          throw std::runtime_error("File exceeds the 2 MiB write limit.");
-        }
-        if (sensitive_filename(relative.filename().string())) {
-          throw std::runtime_error("Refusing to write a sensitive file path: " +
-                                   action.path);
-        }
-        const auto target = checked_target(root, relative);
-        if (std::filesystem::exists(target) &&
-            !std::filesystem::is_regular_file(target)) {
-          throw std::runtime_error("Refusing to replace a non-file: " +
-                                   action.path);
-        }
-        std::ostringstream review;
-        review << "Coder requests this file write:\nPath: " << action.path
-               << "\nSize: " << action.content.size() << " bytes\n\n"
-               << action.content
-               << "\n\nApprove this exact file content?";
-        if (confirm(review.str())) {
-          tool_result = write_file(root, session, action.path, action.content, turn);
-        } else {
-          tool_result = "User declined this file write. The file was not changed.";
-        }
-      } else if (action.name == "run_command") {
-        if (action.command.empty()) {
-          throw std::runtime_error("run_command requires a command.");
-        }
-        const int timeout = std::clamp(action.timeout_seconds, 1, 300);
-        std::ostringstream review;
-        review << "Coder requests shell execution:\nCommand: " << action.command
-               << "\nTimeout: " << timeout << " seconds\n"
-               << "Working directory: project root\n\n"
-               << "Approve this exact command?";
-        if (confirm(review.str())) {
-          tool_result = run_command(root, action.command, timeout);
-        } else {
-          tool_result = "User declined this command. It was not executed.";
-        }
-      } else {
-        throw std::runtime_error("Unsupported coder action: " + action.name);
-      }
+      tool_result = execute_action(action, response_turn);
     } catch (const std::exception& error) {
       tool_result = std::string("Tool error: ") + error.what();
     }
 
-    constexpr std::size_t context_result_limit = 6000;
-    if (tool_result.size() > context_result_limit) {
-      tool_result.resize(context_result_limit);
-      tool_result += "\n[tool output truncated for model context; full output is in session log]";
-    }
+    // coder.md keeps the full result for a human; the model context gets a
+    // bounded copy, and the transcript stores exactly what the model saw.
     coder_log += "### Tool result\n\n" + tool_result + "\n\n";
+    std::string context_result = tool_result;
+    constexpr std::size_t context_result_limit = 6000;
+    if (context_result.size() > context_result_limit) {
+      context_result.resize(context_result_limit);
+      context_result +=
+          "\n[tool output truncated for model context; full output is in session log]";
+    }
+    const std::string result_message =
+        "Tool result:\n" + context_result +
+        "\nContinue the task. Use another action or finish.";
+    persist_message("user", result_message, "", response_turn);
+    coder_messages.emplace_back("user", result_message);
     write_atomic(session / "coder.md", coder_log);
-    save_manifest(session, "coder-turn-" + std::to_string(turn));
-    coder_messages.emplace_back(
-        "user", "Tool result:\n" + tool_result +
-                    "\nContinue the task. Use another action or finish.");
+    save_manifest(session, "coder-turn-" + std::to_string(response_turn));
+    pending_assistant = false;
   }
-  save_manifest(session, "turn-limit");
-  throw std::runtime_error("Coder reached the " + std::to_string(max_turns) +
-                           "-turn limit. Its work log is saved at " +
-                           (session / "coder.md").string());
 }
 
 }  // namespace mtrxai

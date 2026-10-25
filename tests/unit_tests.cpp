@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 
+#include "mtrxai/coder_transcript.hpp"
 #include "mtrxai/files.hpp"
 #include "mtrxai/pipeline.hpp"
 #include "mtrxai/provider.hpp"
@@ -269,6 +270,91 @@ TEST_CASE("RawRecorder persists chunks and read_raw_text filters by turn") {
   }
   CHECK(mtrxai::read_raw_text(path, 1) == "lo wor!");
   std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("CoderTranscript round-trips every message it appends") {
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("mtrxai_transcript_test_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(root);
+  const auto path = root / "coder" / "messages.jsonl";
+
+  mtrxai::CoderMessage system;
+  system.role = "system";
+  system.content = "You are the coding agent.";
+  mtrxai::CoderMessage initial;
+  initial.role = "user";
+  initial.content = "Task with \"quotes\", a newline\nand UTF-8: caf\xc3\xa9 \xe2\x9c\x93";
+  mtrxai::CoderMessage assistant;
+  assistant.role = "assistant";
+  assistant.content = R"({"action":"finish","summary":"done"})";
+  assistant.thinking = "First line.\nSecond line with <angles> & symbols.";
+  assistant.turn = 1;
+  mtrxai::CoderMessage result;
+  result.role = "user";
+  result.content = "Tool result:\nSaved hello.txt (6 bytes).";
+  result.turn = 1;
+
+  {
+    mtrxai::CoderTranscript transcript(path);
+    transcript.append(system);
+    transcript.append(initial);
+    transcript.append(assistant);
+    transcript.append(result);
+  }
+
+  // The parent directory is created and the file is readable only by its
+  // owner; one message is one JSON line.
+  const auto mode = std::filesystem::status(path).permissions();
+  CHECK((mode & std::filesystem::perms::group_all) ==
+        std::filesystem::perms::none);
+  CHECK((mode & std::filesystem::perms::others_all) ==
+        std::filesystem::perms::none);
+
+  const auto messages = mtrxai::CoderTranscript::load(path);
+  REQUIRE(messages.size() == 4);
+  CHECK(messages[0].role == "system");
+  CHECK(messages[0].content == system.content);
+  CHECK(messages[0].turn == 0);
+  CHECK(messages[1].role == "user");
+  CHECK(messages[1].content == initial.content);
+  CHECK(messages[1].thinking.empty());
+  CHECK(messages[2].role == "assistant");
+  CHECK(messages[2].content == assistant.content);
+  CHECK(messages[2].thinking == assistant.thinking);
+  CHECK(messages[2].turn == 1);
+  CHECK(messages[3].role == "user");
+  CHECK(messages[3].content == result.content);
+  CHECK(messages[3].turn == 1);
+
+  // Opening it again appends instead of truncating, which is what a resumed
+  // Coder needs.
+  {
+    mtrxai::CoderTranscript transcript(path);
+    mtrxai::CoderMessage next;
+    next.role = "assistant";
+    next.content = "more";
+    next.turn = 2;
+    transcript.append(next);
+  }
+  CHECK(mtrxai::CoderTranscript::load(path).size() == 5);
+
+  // A crash can leave a partial or hand-edited line. It is skipped, and the
+  // surrounding messages still load.
+  {
+    std::ofstream extra(path, std::ios::app);
+    extra << "{\"role\":\"assistant\",\"content\":\"truncated\"\n";
+    extra << "{\"role\":\"tool\",\"content\":\"unknown role\"}\n";
+    extra << "{\"role\":\"assistant\"}\n";
+    extra << "\n";
+    extra << R"({"role":"user","content":"last","turn":3})" << "\n";
+  }
+  const auto recovered = mtrxai::CoderTranscript::load(path);
+  REQUIRE(recovered.size() == 6);
+  CHECK(recovered.back().content == "last");
+  CHECK(recovered.back().turn == 3);
+
+  CHECK(mtrxai::CoderTranscript::load(root / "missing.jsonl").empty());
+  std::filesystem::remove_all(root);
 }
 
 TEST_CASE("parse_manifest_stage reads only a string completed_stage") {

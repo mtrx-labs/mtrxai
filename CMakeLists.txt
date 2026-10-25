@@ -21,6 +21,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(JSONC REQUIRED IMPORTED_TARGET json-c)
 
 add_library(mtrxai_core STATIC
+  src/coder_transcript.cpp
   src/config.cpp
   src/files.cpp
   src/pipeline.cpp

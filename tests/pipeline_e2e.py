@@ -313,8 +313,14 @@ def check_resume(binary, root):
          "content": "resumed-ok\n"},
         {"action": "finish", "summary": "Created hello-resume.txt."},
     ]
+    mid_turn_answers = [
+        {"action": "write_file", "path": "hello-midturn.txt",
+         "content": "midturn-ok\n"},
+        {"action": "finish", "summary": "Created hello-midturn.txt."},
+    ]
     counts = {"chief": 0, "prompter": 0, "coder": 0}
-    state = {"fail_first_coder": True}
+    state = {"fail_first_coder": True, "phase": "first", "coder_request": 0}
+    coder_bodies = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -325,6 +331,8 @@ def check_resume(binary, root):
                     else "prompter" if model.startswith("prompter-")
                     else "coder")
             counts[role] += 1
+            if role == "coder":
+                coder_bodies.append(body)
             if role == "coder" and state["fail_first_coder"]:
                 state["fail_first_coder"] = False
                 message = b"mock coder unavailable"
@@ -340,12 +348,17 @@ def check_resume(binary, root):
             elif role == "prompter":
                 content = prompter_answer
             else:
-                # The first coder request failed, so the successful write and
-                # finish answers are requests two and three.
-                index = counts["coder"] - 2
-                assert 0 <= index < len(coder_answers), \
-                    "unexpected coder request"
-                content = json.dumps(coder_answers[index])
+                answers = (coder_answers if state["phase"] == "first"
+                           else mid_turn_answers)
+                index = state["coder_request"]
+                state["coder_request"] += 1
+                assert 0 <= index < len(answers), "unexpected coder request"
+                content = json.dumps(answers[index])
+                if index == 0:
+                    # The first reply also exercises thinking persistence: the
+                    # <think> block is stripped before the action is parsed and
+                    # stored separately in the transcript.
+                    content = ("<think>Coder thinking process</think>" + content)
 
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -452,7 +465,15 @@ def check_resume(binary, root):
     assert manifest["completed_stage"] == "prompter", manifest
     assert (session / "chief.md").exists()
     assert (session / "prompt.md").exists()
-    assert not (session / "coder" / "messages.jsonl").exists()
+    # The Coder failed while generating, but its initial context is already
+    # durable. Resume must continue from it instead of adding a second copy.
+    transcript = session / "coder" / "messages.jsonl"
+    records = [json.loads(line)
+               for line in transcript.read_text().splitlines()]
+    assert [record["role"] for record in records] == ["system", "user"], records
+    assert records[0]["content"].startswith("You are the coding agent")
+    assert "Original user request:" in records[1]["content"]
+    assert "create hello-resume.txt" in records[1]["content"]
 
     # Resume without an id: only the Coder may be called again.
     process, master, output = start(["--resume"])
@@ -484,6 +505,29 @@ def check_resume(binary, root):
     assert (workspace / "hello-resume.txt").read_text() == "resumed-ok\n"
     manifest = json.loads((session / "manifest.json").read_text())
     assert manifest["completed_stage"] == "finished", manifest
+
+    # The transcript has the durable conversation, not the failed attempt:
+    # one system and initial user message, then the write turn and its result,
+    # then the finish turn. Thinking is stored beside the content.
+    records = [json.loads(line)
+               for line in transcript.read_text().splitlines()]
+    assert [record["role"] for record in records] == [
+        "system", "user", "assistant", "user", "assistant"], records
+    assert [record.get("turn", 0) for record in records] == [0, 0, 1, 1, 2]
+    assert records[2]["thinking"] == "Coder thinking process"
+    assert json.loads(records[2]["content"])["action"] == "write_file"
+    assert records[3]["content"].startswith(
+        "Tool result:\nSaved hello-resume.txt")
+    assert json.loads(records[4]["content"])["action"] == "finish"
+    assert (session / "coder_turn_1_thinking.md").read_text().strip() == \
+        "Coder thinking process"
+    # The finish request after resume carried the persisted tool result, so it
+    # was a continuation rather than a fresh Coder conversation.
+    finish_messages = coder_bodies[2]["messages"]
+    assert [message["role"] for message in finish_messages] == [
+        "user", "assistant", "user"], finish_messages
+    assert "write_file" in finish_messages[1]["content"]
+    assert "Saved hello-resume.txt" in finish_messages[2]["content"]
 
     # An explicit id of a finished session is reported without any model work.
     result = subprocess.run(
@@ -523,6 +567,97 @@ def check_resume(binary, root):
         stop(process, master)
     assert counts == {"chief": 1, "prompter": 1, "coder": 3}, counts
     shutil.rmtree(foreign)
+
+    # Mid-turn resume: the Coder proposes a write, the process dies while the
+    # approval screen is waiting, and resume must ask again rather than apply
+    # the saved action automatically.
+    mid_workspace = root / "resume-midturn"
+    mid_workspace.mkdir()
+    state["phase"] = "mid_turn"
+    state["coder_request"] = 0
+    process, master, output = start([], cwd=mid_workspace)
+    try:
+        wait_for(output, master, "Describe what you want to build")
+        os.write(master, b"create hello-midturn.txt\n")
+        output.clear()
+        wait_for(output, master, "Approve this exact file content?")
+        assert not (mid_workspace / "hello-midturn.txt").exists()
+        process.kill()
+        process.wait(timeout=5)
+    finally:
+        stop(process, master)
+
+    mid_sessions = [entry for entry in sessions_root.iterdir()
+                    if entry.name not in {finished.name, session.name}]
+    assert len(mid_sessions) == 1, mid_sessions
+    mid_session = mid_sessions[0]
+    mid_transcript = mid_session / "coder" / "messages.jsonl"
+    records = [json.loads(line)
+               for line in mid_transcript.read_text().splitlines()]
+    assert [record["role"] for record in records] == [
+        "system", "user", "assistant"], records
+    assert records[-1]["turn"] == 1
+    assert json.loads(records[-1]["content"])["action"] == "write_file"
+    manifest = json.loads((mid_session / "manifest.json").read_text())
+    assert manifest["completed_stage"] == "coder-turn-1", manifest
+
+    # Resume without an id sees the one unfinished session. The pending write
+    # is not applied until it is approved again.
+    process, master, output = start(["--resume"], cwd=mid_workspace)
+    try:
+        wait_for(output, master, "Resuming session")
+        wait_for(output, master, "Approve this exact file content?")
+        assert not (mid_workspace / "hello-midturn.txt").exists()
+        os.write(master, b"y")
+        wait_for(output, master, "Finished: Created hello-midturn.txt.")
+        wait_for(output, master, "Finished.")
+        os.write(master, b"\n")
+        wait_for(output, master, "Describe what you want to build")
+        os.write(master, b"/quit\n")
+        assert process.wait(timeout=10) == 0
+    finally:
+        stop(process, master)
+
+    assert counts == {"chief": 2, "prompter": 2, "coder": 5}, counts
+    assert (mid_workspace / "hello-midturn.txt").read_text() == "midturn-ok\n"
+    manifest = json.loads((mid_session / "manifest.json").read_text())
+    assert manifest["completed_stage"] == "finished", manifest
+    records = [json.loads(line)
+               for line in mid_transcript.read_text().splitlines()]
+    assert [record["role"] for record in records] == [
+        "system", "user", "assistant", "user", "assistant"], records
+    assert [record.get("turn", 0) for record in records] == [0, 0, 1, 1, 2]
+    assert "Saved hello-midturn.txt" in records[3]["content"]
+    # The resumed run asked the model only for the turn after the re-approved
+    # write; the pending write itself made no request.
+    assert len(coder_bodies) == 5, len(coder_bodies)
+    finish_messages = coder_bodies[4]["messages"]
+    assert [message["role"] for message in finish_messages] == [
+        "user", "assistant", "user"], finish_messages
+    assert "hello-midturn" in finish_messages[2]["content"]
+
+    # A crash after the finish reply was saved but before the manifest was
+    # updated is the other resume boundary: the action is completed without
+    # loading a model.
+    pending_finish = sessions_root / "29991231-235959-997"
+    shutil.copytree(mid_session, pending_finish)
+    manifest = json.loads((pending_finish / "manifest.json").read_text())
+    manifest["completed_stage"] = "coder-turn-2"
+    (pending_finish / "manifest.json").write_text(json.dumps(manifest))
+    coder_calls_before_finish = counts["coder"]
+    process, master, output = start(["--resume", pending_finish.name],
+                                    cwd=mid_workspace)
+    try:
+        wait_for(output, master, "Finished: Created hello-midturn.txt.")
+        assert counts["coder"] == coder_calls_before_finish
+        os.write(master, b"\n")
+        wait_for(output, master, "Describe what you want to build")
+        os.write(master, b"/quit\n")
+        assert process.wait(timeout=10) == 0
+    finally:
+        stop(process, master)
+    manifest = json.loads((pending_finish / "manifest.json").read_text())
+    assert manifest["completed_stage"] == "finished", manifest
 
     server.shutdown()
 
