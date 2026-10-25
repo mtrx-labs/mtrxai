@@ -3,8 +3,10 @@
 #include "mtrxai/coder_transcript.hpp"
 #include "mtrxai/files.hpp"
 #include "mtrxai/provider.hpp"
+#include "mtrxai/safety.hpp"
 #include "mtrxai/session.hpp"
 #include "mtrxai/signals.hpp"
+#include "mtrxai/textutil.hpp"
 
 #include <json-c/json.h>
 
@@ -34,39 +36,6 @@
 #include <unistd.h>
 
 namespace mtrxai {
-
-bool sensitive_filename(const std::string& name) {
-  // Extract base filename in case a relative path was passed
-  const std::string filename = std::filesystem::path(name).filename().string();
-  std::string lower = filename;
-  std::transform(lower.begin(), lower.end(), lower.begin(),
-                 [](unsigned char character) {
-                   return static_cast<char>(std::tolower(character));
-                 });
-
-  // Exact sensitive names
-  if (lower == ".env" || lower == ".netrc" || lower == ".npmrc" ||
-      lower == ".pypirc" || lower == "credentials.json") {
-    return true;
-  }
-
-  // Sensitive prefix patterns (.env.*, id_rsa*, id_ed25519*)
-  if (lower.rfind(".env.", 0) == 0 || lower.rfind("id_rsa", 0) == 0 ||
-      lower.rfind("id_ed25519", 0) == 0) {
-    return true;
-  }
-
-  // Sensitive suffix patterns (*.pem, *.key, *.p12, *.pfx)
-  for (const auto* suffix : {".pem", ".key", ".p12", ".pfx"}) {
-    const std::size_t suffix_len = std::strlen(suffix);
-    if (lower.size() >= suffix_len &&
-        lower.compare(lower.size() - suffix_len, suffix_len, suffix) == 0) {
-      return true;
-    }
-  }
-
-  return false;
-}
 
 ThinkingResult extract_thinking(const std::string& text) {
   ThinkingResult result;
@@ -234,31 +203,6 @@ std::string workspace_snapshot(const std::filesystem::path& root) {
   return result.str();
 }
 
-std::string extract_json(const std::string& output) {
-  const std::size_t fence = output.find("```");
-  std::string candidate = output;
-  if (fence != std::string::npos) {
-    const std::size_t first_line = output.find('\n', fence);
-    const std::size_t last_fence = output.find("```", fence + 3);
-    if (first_line != std::string::npos && last_fence > first_line) {
-      candidate = output.substr(first_line + 1, last_fence - first_line - 1);
-    }
-  }
-  const auto first = candidate.find_first_not_of(" \t\r\n");
-  const auto last = candidate.find_last_not_of(" \t\r\n");
-  if (first == std::string::npos) return candidate;
-  candidate = candidate.substr(first, last - first + 1);
-  if (candidate.rfind("json\n", 0) == 0) candidate.erase(0, 5);
-  if (!candidate.empty() && candidate.front() == '{') return candidate;
-
-  const std::size_t object_start = candidate.find('{');
-  const std::size_t object_end = candidate.rfind('}');
-  if (object_start != std::string::npos && object_end > object_start) {
-    return candidate.substr(object_start, object_end - object_start + 1);
-  }
-  return candidate;
-}
-
 std::string required_string(json_object* root, const char* key) {
   json_object* value = nullptr;
   if (!json_object_object_get_ex(root, key, &value) ||
@@ -331,47 +275,6 @@ std::string rejection_correction(const std::string& rejection) {
          "\n\nReply with exactly one JSON object and nothing else. Use only "
          "the supported actions from the system prompt, with no markdown "
          "fences or extra text.";
-}
-
-std::filesystem::path checked_target(const std::filesystem::path& root,
-                                     const std::filesystem::path& relative) {
-  if (relative.empty() || relative.is_absolute()) {
-    throw std::runtime_error("Path must be relative to the project.");
-  }
-  const auto target = root / relative;
-  for (const auto& component : relative) {
-    if (component == "..") {
-      throw std::runtime_error("Refusing a path that traverses outside its directory.");
-    }
-    if (component == ".git" || component == ".mtrxai" ||
-        component == "copilot-worktrees" || component == "build" ||
-        component == "node_modules" || component == "vendor" ||
-        component == "target" || component == "dist") {
-      throw std::runtime_error("Refusing to modify protected path: " +
-                               relative.string());
-    }
-  }
-  std::error_code error;
-  const auto status = std::filesystem::symlink_status(target, error);
-  if (!error && std::filesystem::is_symlink(status)) {
-    throw std::runtime_error("Refusing to overwrite a symlink: " + relative.string());
-  }
-  error.clear();
-  const auto resolved = std::filesystem::weakly_canonical(target, error);
-  if (error) {
-    throw std::runtime_error("Could not resolve proposed path " + relative.string() +
-                             ": " + error.message());
-  }
-  const auto within_root = resolved.lexically_relative(root);
-  if (within_root.empty() || *within_root.begin() == "..") {
-    throw std::runtime_error("Refusing to write outside the project: " +
-                             relative.string());
-  }
-  if (std::filesystem::exists(target) &&
-      !std::filesystem::is_regular_file(target)) {
-    throw std::runtime_error("Refusing to replace a non-file: " + relative.string());
-  }
-  return target;
 }
 
 std::string list_files(const std::filesystem::path& root,

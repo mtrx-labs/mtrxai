@@ -1264,7 +1264,14 @@ def run(binary):
         assert "outside the project" in json.dumps(generated_requests[7]["body"]["messages"])
         assert "command timed out" in json.dumps(generated_requests[10]["body"]["messages"])
         assert "exit_code=3" in json.dumps(generated_requests[11]["body"]["messages"])
-        assert "Permission denied" in json.dumps(generated_requests[12]["body"]["messages"])
+        if os.geteuid() == 0:
+            # root can read another process's environ, so the kernel's
+            # permission check this case relies on does not happen.
+            print("Skipping /proc/$PPID/environ 'Permission denied' assertion: "
+                  "running as root bypasses it.")
+        else:
+            assert "Permission denied" in json.dumps(
+                generated_requests[12]["body"]["messages"])
         assert "test-ok" in json.dumps(generated_requests[13]["body"]["messages"])
         assert "must-not-leak" not in json.dumps(requests + generated_requests)
         assert "local-secret-value" not in json.dumps(requests + generated_requests)

@@ -11,9 +11,11 @@
 #include "mtrxai/files.hpp"
 #include "mtrxai/pipeline.hpp"
 #include "mtrxai/provider.hpp"
+#include "mtrxai/safety.hpp"
 #include "mtrxai/session.hpp"
 #include "mtrxai/signals.hpp"
 #include "mtrxai/stream_parse.hpp"
+#include "mtrxai/textutil.hpp"
 #include "mtrxai/utf8.hpp"
 
 TEST_CASE("llama_log_path uses state home and role") {
@@ -86,6 +88,21 @@ TEST_CASE("sensitive_filename allows standard project files") {
   CHECK_FALSE(mtrxai::sensitive_filename("config.json"));
   CHECK_FALSE(mtrxai::sensitive_filename("Makefile"));
   CHECK_FALSE(mtrxai::sensitive_filename("index.ts"));
+}
+
+TEST_CASE("extract_json accepts bare, fenced, and prose-wrapped objects") {
+  CHECK(mtrxai::extract_json(R"({"action":"finish"})") ==
+        R"({"action":"finish"})");
+  CHECK(mtrxai::extract_json(
+            "```json\n{\"action\":\"finish\"}\n```") ==
+        R"({"action":"finish"})");
+  CHECK(mtrxai::extract_json(
+            "Here is the action:\n{\"action\":\"finish\"}\nThanks") ==
+        R"({"action":"finish"})");
+  CHECK(mtrxai::extract_json("  \n json\n{\"x\":1}  ") == R"({"x":1})");
+  // Without a JSON object the text is returned trimmed, not rejected here;
+  // the caller validates it.
+  CHECK(mtrxai::extract_json("  no object  ") == "no object");
 }
 
 TEST_CASE("extract_thinking separates reasoning from answer") {

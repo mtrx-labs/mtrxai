@@ -2,6 +2,7 @@
 
 #include "mtrxai/config.hpp"
 #include "mtrxai/provider.hpp"
+#include "mtrxai/safety.hpp"
 
 #include <atomic>
 #include <filesystem>
@@ -9,10 +10,6 @@
 #include <string>
 
 namespace mtrxai {
-
-// Returns true if filename matches sensitive file names or patterns that must
-// not be read, listed, or written by the automated coder.
-bool sensitive_filename(const std::string& name);
 
 struct ThinkingResult {
   std::string content;
