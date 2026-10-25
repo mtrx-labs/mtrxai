@@ -35,11 +35,22 @@ class Pipeline {
   void run(const std::string& request, const Status& status,
            const Confirm& confirm, const InferenceSession::TokenSink& tokens = {});
 
+  // Continues a saved session. The request is read from request.md; completed
+  // Chief and Prompter stages are reused without starting those models again.
+  void resume(const std::filesystem::path& session, const Status& status,
+              const Confirm& confirm,
+              const InferenceSession::TokenSink& tokens = {});
+
   // Call from a UI thread to stop the current run cleanly: the active model
   // request is aborted and queued stages throw Cancelled.
   void request_cancel();
 
  private:
+  void run_impl(const std::filesystem::path& resume_session,
+                std::string request, const Status& status,
+                const Confirm& confirm,
+                const InferenceSession::TokenSink& tokens);
+
   Config& config_;
   std::atomic<bool> cancelled_{false};
   std::atomic<InferenceSession*> active_session_{nullptr};

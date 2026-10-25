@@ -25,6 +25,7 @@ add_library(mtrxai_core STATIC
   src/files.cpp
   src/pipeline.cpp
   src/provider.cpp
+  src/session.cpp
   src/setup_wizard.cpp
   src/signals.cpp
   src/tui.cpp

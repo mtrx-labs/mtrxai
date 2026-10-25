@@ -101,6 +101,7 @@ Edit `~/.config/mtrxai/config.json` or use TUI commands:
 
 ```text
 /roles
+/sessions
 /model chief ollama deepseek-r1:8b
 /model prompter ollama qwen2.5:3b
 /gguf coder /path/to/your/Mellum2.1-12B-A2.5B-Thinking-Q6_K.gguf
@@ -182,6 +183,23 @@ unload active Ollama models, restore the terminal (`endwin()`), and exit non-zer
 Avoid using remote endpoints for workspaces whose contents must
 remain local. Run the mock-provider integration test with
 `ctest --test-dir build --output-on-failure`.
+
+## Sessions and resume
+
+Every task creates a session directory under
+`$XDG_STATE_HOME/mtrxai/sessions/<timestamp>/` and records its progress in
+`manifest.json`. `mtrxai --resume` continues the most recent unfinished session;
+`mtrxai --resume <id>` continues a specific one. Inside the TUI, `/sessions`
+lists recent sessions with their id, saved stage, and request. A resumed task
+starts immediately.
+
+Resume reuses the saved Chief and Prompter output instead of loading those
+models again, so a failure later in the pipeline does not repeat earlier work.
+The session records the project directory it belongs to, and resume refuses to
+run from a different directory. If the Coder had already started, its unfinished
+attempt is kept as `coder.before-resume-<timestamp>` and the Coder begins again
+from the saved plan. A session whose manifest says `finished` is reported as
+complete without starting any model.
 
 ## License
 

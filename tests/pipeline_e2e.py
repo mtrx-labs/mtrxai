@@ -286,6 +286,247 @@ def check_esc_cancellation(binary, root):
         os.close(master)
 
 
+def check_resume(binary, root):
+    """A run that failed after the Prompter must resume without calling the
+    Chief or Prompter again, and --resume without an id must skip a newer
+    finished session."""
+    workspace = root / "resume-workspace"
+    workspace.mkdir()
+    state_home = root / "resume-state"
+    sessions_root = state_home / "mtrxai" / "sessions"
+    sessions_root.mkdir(parents=True)
+
+    # Newer than the real run but already complete: --resume must ignore it.
+    finished = sessions_root / "29991231-235959-999"
+    finished.mkdir()
+    (finished / "request.md").write_text("must not be resumed\n")
+    (finished / "manifest.json").write_text(
+        json.dumps({"completed_stage": "finished",
+                    "updated_at": "2999-12-31 23:59:59"}))
+
+    chief_answer = ("<think>Chief thinking process</think>"
+                    "Chief brief: create hello-resume.txt.")
+    prompter_answer = ("<think>Prompter thinking process</think>"
+                       "Prompter brief: write hello-resume.txt.")
+    coder_answers = [
+        {"action": "write_file", "path": "hello-resume.txt",
+         "content": "resumed-ok\n"},
+        {"action": "finish", "summary": "Created hello-resume.txt."},
+    ]
+    counts = {"chief": 0, "prompter": 0, "coder": 0}
+    state = {"fail_first_coder": True}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(
+                self.rfile.read(int(self.headers["Content-Length"])))
+            model = str(body.get("model", ""))
+            role = ("chief" if model.startswith("chief-")
+                    else "prompter" if model.startswith("prompter-")
+                    else "coder")
+            counts[role] += 1
+            if role == "coder" and state["fail_first_coder"]:
+                state["fail_first_coder"] = False
+                message = b"mock coder unavailable"
+                self.send_response(500)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(message)))
+                self.end_headers()
+                self.wfile.write(message)
+                return
+
+            if role == "chief":
+                content = chief_answer
+            elif role == "prompter":
+                content = prompter_answer
+            else:
+                # The first coder request failed, so the successful write and
+                # finish answers are requests two and three.
+                index = counts["coder"] - 2
+                assert 0 <= index < len(coder_answers), \
+                    "unexpected coder request"
+                content = json.dumps(coder_answers[index])
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            try:
+                for start in range(0, len(content), 9):
+                    event = json.dumps(
+                        {"type": "content_block_delta",
+                         "delta": {"type": "text_delta",
+                                   "text": content[start:start + 9]}})
+                    self.wfile.write(f"data: {event}\n\n".encode())
+                    self.wfile.flush()
+                self.wfile.write(b"data: {\"type\":\"message_stop\"}\n\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    config = {}
+    for role in ("chief", "prompter", "coder"):
+        config[role] = {
+            "provider": "anthropic",
+            "model": f"{role}-resume",
+            "base_url": f"http://127.0.0.1:{server.server_port}",
+            "api_key_env": "",
+            "gguf_path": "",
+            "context_size": 2048,
+        }
+    config_home = root / "resume-config"
+    config_path = config_home / "mtrxai" / "config.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps(config))
+    credentials_path = config_path.parent / "credentials.json"
+    credentials_path.write_text(
+        json.dumps({role: "resume-key" for role in ("chief", "prompter",
+                                                    "coder")}))
+    credentials_path.chmod(0o600)
+    env = os.environ.copy()
+    env.update({
+        "XDG_CONFIG_HOME": str(config_home),
+        "XDG_STATE_HOME": str(state_home),
+        "TERM": "xterm",
+    })
+
+    def start(extra_args, cwd=workspace):
+        master, slave = pty.openpty()
+        process = subprocess.Popen(
+            [binary, "--no-update-check"] + extra_args, cwd=cwd,
+            env=env, stdin=slave, stdout=slave, stderr=slave
+        )
+        os.close(slave)
+        return process, master, bytearray()
+
+    def wait_for(output, master, needle, timeout=20):
+        target = needle.encode()
+        deadline = time.time() + timeout
+        while target not in output and time.time() < deadline:
+            readable, _, _ = select.select([master], [], [], 0.2)
+            if readable:
+                try:
+                    output.extend(os.read(master, 8192))
+                except OSError:
+                    break
+        if target not in output:
+            raise AssertionError(
+                f"Timed out waiting for {needle!r}: "
+                f"{output.decode(errors='replace')[-1500:]}")
+
+    def stop(process, master):
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        os.close(master)
+
+    # First run: the Chief and Prompter succeed, then the Coder request fails.
+    process, master, output = start([])
+    try:
+        wait_for(output, master, "Describe what you want to build")
+        os.write(master, b"create hello-resume.txt\n")
+        output.clear()
+        wait_for(output, master, "Pipeline stopped:")
+        wait_for(output, master, "Completed stage outputs remain saved")
+        os.write(master, b"\n")
+        wait_for(output, master, "Describe what you want to build")
+        os.write(master, b"/quit\n")
+        assert process.wait(timeout=10) == 0
+    finally:
+        stop(process, master)
+
+    real_sessions = [entry for entry in sessions_root.iterdir()
+                     if entry.name != finished.name]
+    assert len(real_sessions) == 1, real_sessions
+    session = real_sessions[0]
+    manifest = json.loads((session / "manifest.json").read_text())
+    assert manifest["completed_stage"] == "prompter", manifest
+    assert (session / "chief.md").exists()
+    assert (session / "prompt.md").exists()
+    assert not (session / "coder" / "messages.jsonl").exists()
+
+    # Resume without an id: only the Coder may be called again.
+    process, master, output = start(["--resume"])
+    try:
+        wait_for(output, master, "Resuming session")
+        wait_for(output, master, "Approve this exact file content?")
+        os.write(master, b"y")
+        wait_for(output, master, "Created hello-resume.txt.")
+        wait_for(output, master, "Finished.")
+        os.write(master, b"\n")
+        wait_for(output, master, "Describe what you want to build")
+        # Type the command one key at a time. Before blocking input was
+        # restored after a run, the 100 ms pump timeout silently dropped
+        # characters typed at a human pace.
+        for character in "/sessions\n":
+            os.write(master, character.encode())
+            time.sleep(0.15)
+        wait_for(output, master, "Saved sessions")
+        assert session.name.encode() in output
+        assert finished.name.encode() in output
+        os.write(master, b" ")
+        wait_for(output, master, "Describe what you want to build")
+        os.write(master, b"/quit\n")
+        assert process.wait(timeout=10) == 0
+    finally:
+        stop(process, master)
+
+    assert counts == {"chief": 1, "prompter": 1, "coder": 3}, counts
+    assert (workspace / "hello-resume.txt").read_text() == "resumed-ok\n"
+    manifest = json.loads((session / "manifest.json").read_text())
+    assert manifest["completed_stage"] == "finished", manifest
+
+    # An explicit id of a finished session is reported without any model work.
+    result = subprocess.run(
+        [binary, "--resume", finished.name], cwd=workspace, env=env,
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result
+    assert "already complete" in result.stdout
+    # With every session finished, no id has nothing to do.
+    result = subprocess.run(
+        [binary, "--resume"], cwd=workspace, env=env,
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result
+    assert "nothing to resume" in result.stdout
+
+    result = subprocess.run(
+        [binary, "--resume", "20000101-000000-000"], cwd=workspace, env=env,
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 1, result
+    assert "No saved session matches" in result.stderr
+
+    # A session remembers its project directory; resuming from elsewhere must
+    # stop before any model is called.
+    foreign = sessions_root / "29991231-235959-998"
+    foreign.mkdir()
+    (foreign / "request.md").write_text("foreign task\n")
+    (foreign / "manifest.json").write_text(
+        json.dumps({"completed_stage": "request"}))
+    (foreign / "project-root.txt").write_text(str(workspace.resolve()) + "\n")
+    process, master, output = start(["--resume", foreign.name], cwd=root)
+    try:
+        wait_for(output, master, "This session belongs to")
+        os.write(master, b"\n")
+        wait_for(output, master, "Describe what you want to build")
+        os.write(master, b"/quit\n")
+        assert process.wait(timeout=10) == 0
+    finally:
+        stop(process, master)
+    assert counts == {"chief": 1, "prompter": 1, "coder": 3}, counts
+    shutil.rmtree(foreign)
+
+    server.shutdown()
+
+
 def check_signal_handling(binary, root):
     user_home = root / "signal-home"
     user_home.mkdir()
@@ -367,6 +608,7 @@ def run(binary):
     check_setup_wizard(binary, temp)
     check_signal_handling(binary, temp)
     check_esc_cancellation(binary, temp)
+    check_resume(binary, temp)
     workspace = temp / "workspace"
     outside = temp / "outside"
     config_home = temp / "config"
@@ -713,4 +955,5 @@ def run(binary):
 
 if __name__ == "__main__":
     run(sys.argv[1])
-    print("Sequential stages, iterative coder tools, approvals, persistence, and Esc cancellation passed.")
+    print("Sequential stages, iterative coder tools, approvals, persistence, "
+          "Esc cancellation, and resume passed.")

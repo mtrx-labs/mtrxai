@@ -1,6 +1,7 @@
 #include "mtrxai/tui.hpp"
 
 #include "mtrxai/pipeline.hpp"
+#include "mtrxai/session.hpp"
 #include "mtrxai/signals.hpp"
 #include "mtrxai/utf8.hpp"
 
@@ -11,6 +12,7 @@
 #include <cwctype>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <mutex>
@@ -337,6 +339,7 @@ void show_roles(const Config& config) {
 void command_help() {
   show("Commands:\n"
        "  /roles                         show active model assignments & limits\n"
+       "  /sessions                      list saved sessions and resume ids\n"
        "  /model ROLE PROVIDER MODEL      hot-swap a role (ollama, openai, anthropic, gguf)\n"
        "  /endpoint ROLE URL              set an API base URL\n"
        "  /keyenv ROLE ENV_NAME           select an API-key environment variable\n"
@@ -399,6 +402,38 @@ void handle_command(Config& config, const std::filesystem::path& config_file,
   command >> name;
   if (name == "/roles") {
     show_roles(config);
+    return;
+  }
+  if (name == "/sessions") {
+    const auto sessions = list_sessions();
+    if (sessions.empty()) {
+      show("No saved sessions yet.");
+      return;
+    }
+    std::ostringstream text;
+    text << "Saved sessions (newest first):\n\n";
+    const std::size_t shown = std::min<std::size_t>(sessions.size(), 5);
+    for (std::size_t i = 0; i < shown; ++i) {
+      const auto& session = sessions[i];
+      text << session.id << "  "
+           << (session.stage.empty() ? "unknown stage" : session.stage);
+      if (!session.updated_at.empty()) text << "  " << session.updated_at;
+      text << "\n";
+      try {
+        const std::string request = read_session_request(session.path);
+        const std::size_t newline = request.find('\n');
+        std::string summary = request.substr(0, newline);
+        if (summary.size() > 52) summary = summary.substr(0, 49) + "...";
+        text << "  " << summary << "\n";
+      } catch (const std::exception&) {
+        text << "  (request could not be read)\n";
+      }
+    }
+    if (sessions.size() > shown) {
+      text << "\n" << (sessions.size() - shown) << " older session(s) not shown.";
+    }
+    text << "\n\nResume with: mtrxai --resume <id>";
+    show(text.str());
     return;
   }
   if (name == "/help") {
@@ -589,7 +624,8 @@ bool ask_review(UiChannel& channel, const std::string& text) {
   return outcome;
 }
 
-int run_tui(Config& config, const std::filesystem::path& config_file) {
+int run_tui(Config& config, const std::filesystem::path& config_file,
+            const std::filesystem::path& resume_session) {
   if (initscr() == nullptr) throw std::runtime_error("Could not initialize terminal UI");
   mtrxai::signals::set_curses_active(true);
   ScreenGuard screen_guard;
@@ -626,6 +662,7 @@ int run_tui(Config& config, const std::filesystem::path& config_file) {
   bool running = false;
   std::deque<std::string> transcript;
   std::string live;
+  std::filesystem::path pending_resume = resume_session;
 
   // Merge whatever the worker sent since the last redraw.
   const auto pump = [&]() {
@@ -668,65 +705,127 @@ int run_tui(Config& config, const std::filesystem::path& config_file) {
     refresh();
   };
 
+  // Clear anything left by the previous job, then start one pipeline run on a
+  // worker thread. `done` in particular must go back to false, otherwise the
+  // next run looks finished from its first second.
+  const auto start_worker = [&](std::function<void()> job) {
+    {
+      std::lock_guard<std::mutex> guard(channel.mutex);
+      channel.done = false;
+      channel.messages.clear();
+      channel.tokens.clear();
+      channel.review_pending = false;
+      channel.review_text.clear();
+      channel.review_promise = nullptr;
+    }
+    running = true;
+    worker = std::thread([&channel, job = std::move(job)]() {
+      // Mark the job done before the final message: the UI redraws when a
+      // message arrives, so seeing the message also means the footer can
+      // switch to "done" on that same frame. The other order leaves a window
+      // where the UI redraws first and the footer stays on "working".
+      std::string final_message;
+      try {
+        job();
+        final_message = "Finished.";
+      } catch (const Cancelled&) {
+        final_message =
+            "Cancelled. Completed stage outputs remain saved on disk.";
+      } catch (const std::exception& error) {
+        final_message = std::string("Pipeline stopped: ") + error.what() +
+                        "\nCompleted stage outputs remain saved on disk.";
+      }
+      {
+        std::lock_guard<std::mutex> guard(channel.mutex);
+        channel.done = true;
+      }
+      push_message(channel, final_message);
+    });
+    timeout(100);  // pump roughly ten times a second
+  };
+
   while (true) {
     if (!running) {
-      std::string welcome =
-          "Your coding team is ready.\n\n"
-          "Describe what you want to build. The Chief of Staff frames the task, "
-          "the Prompter creates a detailed implementation brief, and the Coder "
-          "turns it into reviewed changes.\n\n"
-          "Roles run sequentially to reduce memory use. Handoffs and progress "
-          "are saved to disk as the work proceeds.\n\n"
-          "Type a task below, or enter /help to see commands.";
-      if (config.coder.provider == "gguf" && config.coder.gguf_path.empty()) {
-        welcome += "\nCoder GGUF path is unset. Use /gguf coder /path/to/your/model.gguf "
-                   "to configure your local model.";
-      }
-      show(welcome);
-      const std::string input = input_line();
-      if (input.empty()) continue;
-      if (input == "/quit") break;
-      if (input[0] == '/') {
+      // The running loop arms a 100 ms input timeout to pump the worker.
+      // Blocking is required again here: a human may take seconds per key,
+      // and each timeout would otherwise throw the partial line away.
+      timeout(-1);
+      if (!pending_resume.empty()) {
+        const std::filesystem::path session = pending_resume;
+        pending_resume.clear();
         try {
-          handle_command(config, config_file, input);
-        } catch (const std::exception& error) {
-          show(std::string("Error: ") + error.what());
-        }
-        getch();
-        continue;
-      }
-      // Start the pipeline on a worker thread so the UI stays responsive.
-      running = true;
-      transcript.clear();
-      live.clear();
-      transcript.push_back("Working on: " + input);
-      worker = std::thread(
-          [&pipeline, &channel, input]() {
-            try {
-              pipeline.run(
-                  input,
-                  [&channel](const std::string& status_text) {
-                    push_message(channel, status_text);
-                  },
-                  [&channel](const std::string& review_text) {
-                    return ask_review(channel, review_text);
-                  },
-                  [&channel](const std::string& token) {
-                    push_token(channel, token);
-                  });
-              push_message(channel, "Finished.");
-            } catch (const Cancelled&) {
-              push_message(channel,
-                           "Cancelled. Completed stage outputs remain saved on disk.");
-            } catch (const std::exception& error) {
-              push_message(channel, std::string("Pipeline stopped: ") +
-                                        error.what() +
-                                        "\nCompleted stage outputs remain saved on disk.");
-            }
-            std::lock_guard<std::mutex> guard(channel.mutex);
-            channel.done = true;
+          const std::string saved_request = read_session_request(session);
+          transcript.clear();
+          live.clear();
+          transcript.push_back("Resuming session " +
+                               session.filename().string());
+          transcript.push_back("Working on: " + saved_request);
+          start_worker([&pipeline, &channel, session]() {
+            pipeline.resume(
+                session,
+                [&channel](const std::string& status_text) {
+                  push_message(channel, status_text);
+                },
+                [&channel](const std::string& review_text) {
+                  return ask_review(channel, review_text);
+                },
+                [&channel](const std::string& token) {
+                  push_token(channel, token);
+                });
           });
-      timeout(100);  // pump roughly ten times a second
+          // A fast resumed run can reach its first approval before the pump
+          // ever redraws; show the session header immediately.
+          redraw();
+        } catch (const std::exception& error) {
+          show(std::string("Could not resume saved session: ") + error.what() +
+               "\n\nPress any key to continue.");
+          getch();
+          continue;
+        }
+      } else {
+        std::string welcome =
+            "Your coding team is ready.\n\n"
+            "Describe what you want to build. The Chief of Staff frames the task, "
+            "the Prompter creates a detailed implementation brief, and the Coder "
+            "turns it into reviewed changes.\n\n"
+            "Roles run sequentially to reduce memory use. Handoffs and progress "
+            "are saved to disk as the work proceeds.\n\n"
+            "Type a task below, or enter /help to see commands.";
+        if (config.coder.provider == "gguf" && config.coder.gguf_path.empty()) {
+          welcome += "\nCoder GGUF path is unset. Use /gguf coder /path/to/your/model.gguf "
+                     "to configure your local model.";
+        }
+        show(welcome);
+        const std::string input = input_line();
+        if (input.empty()) continue;
+        if (input == "/quit") break;
+        if (input[0] == '/') {
+          try {
+            handle_command(config, config_file, input);
+          } catch (const std::exception& error) {
+            show(std::string("Error: ") + error.what());
+          }
+          getch();
+          continue;
+        }
+        transcript.clear();
+        live.clear();
+        transcript.push_back("Working on: " + input);
+        start_worker([&pipeline, &channel, input]() {
+          pipeline.run(
+              input,
+              [&channel](const std::string& status_text) {
+                push_message(channel, status_text);
+              },
+              [&channel](const std::string& review_text) {
+                return ask_review(channel, review_text);
+              },
+              [&channel](const std::string& token) {
+                push_token(channel, token);
+              });
+        });
+        redraw();
+      }
     }
 
     // Running mode: pump worker output, serve approvals, and watch for Esc.

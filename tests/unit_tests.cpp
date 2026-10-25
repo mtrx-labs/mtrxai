@@ -10,6 +10,7 @@
 #include "mtrxai/files.hpp"
 #include "mtrxai/pipeline.hpp"
 #include "mtrxai/provider.hpp"
+#include "mtrxai/session.hpp"
 #include "mtrxai/signals.hpp"
 #include "mtrxai/stream_parse.hpp"
 #include "mtrxai/utf8.hpp"
@@ -268,4 +269,64 @@ TEST_CASE("RawRecorder persists chunks and read_raw_text filters by turn") {
   }
   CHECK(mtrxai::read_raw_text(path, 1) == "lo wor!");
   std::filesystem::remove_all(dir);
+}
+
+TEST_CASE("parse_manifest_stage reads only a string completed_stage") {
+  CHECK(mtrxai::parse_manifest_stage(
+            R"({"completed_stage":"prompter","updated_at":"x"})") ==
+        "prompter");
+  CHECK(mtrxai::parse_manifest_stage(
+            R"({"completed_stage":"coder-turn-3"})") == "coder-turn-3");
+  CHECK(mtrxai::parse_manifest_stage(R"({"updated_at":"x"})").empty());
+  CHECK(mtrxai::parse_manifest_stage(R"({"completed_stage":42})").empty());
+  CHECK(mtrxai::parse_manifest_stage("{not json").empty());
+  CHECK(mtrxai::parse_manifest_stage("").empty());
+}
+
+TEST_CASE("session listing is newest first and skips completed runs") {
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("mtrxai_sessions_test_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(root);
+  const auto add_session = [&root](const std::string& id,
+                                   const std::string& manifest) {
+    const auto directory = root / id;
+    std::filesystem::create_directories(directory);
+    std::ofstream(directory / "request.md") << "task " << id << "\n";
+    if (!manifest.empty()) {
+      std::ofstream(directory / "manifest.json") << manifest;
+    }
+  };
+  add_session("20261025-120000-000",
+              R"({"completed_stage":"finished","updated_at":"2026-10-25 12:00"})");
+  add_session("20261025-110000-000",
+              R"({"completed_stage":"chief","updated_at":"2026-10-25 11:00"})");
+  add_session("20261025-100000-000", "{not json");
+  add_session("20261024-090000-000", "");
+  // A newer directory without request.md is not a session and must not hide
+  // real work from --resume.
+  std::filesystem::create_directories(root / "20261026-000000-000");
+  std::ofstream(root / "20261026-000000-000" / "manifest.json")
+      << R"({"completed_stage":"request"})";
+
+  const auto sessions = mtrxai::list_sessions(root);
+  REQUIRE(sessions.size() == 4);
+  CHECK(sessions[0].id == "20261025-120000-000");
+  CHECK(sessions[0].stage == "finished");
+  CHECK(sessions[1].id == "20261025-110000-000");
+  CHECK(sessions[1].stage == "chief");
+  CHECK(sessions[1].updated_at == "2026-10-25 11:00");
+  CHECK(sessions[2].id == "20261025-100000-000");
+  CHECK(sessions[2].stage.empty());  // unreadable manifest, still resumable
+  CHECK(sessions[3].id == "20261024-090000-000");
+  CHECK(sessions[3].stage.empty());
+
+  CHECK(mtrxai::session_finished(sessions[0]));
+  CHECK_FALSE(mtrxai::session_finished(sessions[1]));
+  const auto latest = mtrxai::latest_unfinished_session(root);
+  REQUIRE(latest.has_value());
+  CHECK(latest->id == "20261025-110000-000");
+  CHECK(mtrxai::read_session_request(latest->path) ==
+        "task 20261025-110000-000\n");
+
+  std::filesystem::remove_all(root);
 }

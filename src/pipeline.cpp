@@ -2,6 +2,7 @@
 
 #include "mtrxai/files.hpp"
 #include "mtrxai/provider.hpp"
+#include "mtrxai/session.hpp"
 #include "mtrxai/signals.hpp"
 
 #include <json-c/json.h>
@@ -133,18 +134,6 @@ struct JsonDeleter {
 };
 
 using Json = std::unique_ptr<json_object, JsonDeleter>;
-
-std::filesystem::path state_root() {
-  const char* xdg = std::getenv("XDG_STATE_HOME");
-  if (xdg != nullptr && *xdg != '\0') {
-    return std::filesystem::path(xdg) / "mtrxai" / "sessions";
-  }
-  const char* home = std::getenv("HOME");
-  if (home == nullptr || *home == '\0') {
-    throw std::runtime_error("HOME is not set; cannot create session artifacts");
-  }
-  return std::filesystem::path(home) / ".local" / "state" / "mtrxai" / "sessions";
-}
 
 std::string timestamp() {
   const auto now = std::chrono::system_clock::now();
@@ -600,6 +589,41 @@ void save_manifest(const std::filesystem::path& session,
                json_object_to_json_string_ext(root.get(), JSON_C_TO_STRING_PRETTY));
 }
 
+std::string read_text_file(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) return {};
+  return std::string(std::istreambuf_iterator<char>(input),
+                     std::istreambuf_iterator<char>());
+}
+
+// A resumed run may have to ask a model again. Keeping the previous raw log
+// (instead of appending to it) is essential: read_raw_text would otherwise
+// concatenate the abandoned partial answer with the new one.
+void move_aside(const std::filesystem::path& path) {
+  std::error_code error;
+  if (!std::filesystem::exists(path, error) || error) return;
+  const auto aside =
+      path.parent_path() /
+      (path.filename().string() + ".before-resume-" + timestamp());
+  std::filesystem::rename(path, aside, error);
+  if (error) {
+    throw std::runtime_error("Could not set aside " + path.string() + ": " +
+                             error.message());
+  }
+}
+
+// Stages only move forward. A manifest from an older version may be missing,
+// so an unknown stage ranks below "request" and the run starts over.
+int stage_rank(const std::string& stage) {
+  if (stage == "finished") return 6;
+  if (stage == "turn-limit") return 5;
+  if (stage.rfind("coder-turn-", 0) == 0) return 4;
+  if (stage == "prompter") return 3;
+  if (stage == "chief") return 2;
+  if (stage == "request") return 1;
+  return 0;
+}
+
 // Keeps Pipeline::active_session_ pointing at the live model only while a
 // stage is generating. Clearing it from the destructor means both normal
 // completion and exceptions (cancel, network failure) leave no dangling
@@ -636,6 +660,19 @@ void Pipeline::request_cancel() {
 void Pipeline::run(const std::string& request, const Status& status,
                    const Confirm& confirm,
                    const InferenceSession::TokenSink& tokens) {
+  run_impl({}, request, status, confirm, tokens);
+}
+
+void Pipeline::resume(const std::filesystem::path& session,
+                      const Status& status, const Confirm& confirm,
+                      const InferenceSession::TokenSink& tokens) {
+  run_impl(session, {}, status, confirm, tokens);
+}
+
+void Pipeline::run_impl(const std::filesystem::path& resume_session,
+                        std::string request, const Status& status,
+                        const Confirm& confirm,
+                        const InferenceSession::TokenSink& tokens) {
   // Each run starts clean; without this, one Esc press would cancel every
   // later run for the rest of the session.
   cancelled_.store(false, std::memory_order_relaxed);
@@ -651,81 +688,154 @@ void Pipeline::run(const std::string& request, const Status& status,
     };
   };
   const auto root = std::filesystem::canonical(std::filesystem::current_path());
-  const auto sessions = state_root();
-  std::error_code error;
-  std::filesystem::create_directories(sessions, error);
-  if (error) {
-    throw std::runtime_error("Could not create session directory: " +
-                             error.message());
-  }
+  const bool resuming = !resume_session.empty();
   std::filesystem::path session;
-  for (int attempt = 0; attempt < 1000; ++attempt) {
-    session = sessions / timestamp();
-    if (attempt != 0) session += "-" + std::to_string(attempt);
-    error.clear();
-    if (std::filesystem::create_directory(session, error)) break;
+  std::string completed_stage;
+  std::error_code error;
+
+  if (!resuming) {
+    const auto sessions = sessions_root();
+    std::filesystem::create_directories(sessions, error);
     if (error) {
       throw std::runtime_error("Could not create session directory: " +
                                error.message());
     }
-    session.clear();
+    for (int attempt = 0; attempt < 1000; ++attempt) {
+      session = sessions / timestamp();
+      if (attempt != 0) session += "-" + std::to_string(attempt);
+      error.clear();
+      if (std::filesystem::create_directory(session, error)) break;
+      if (error) {
+        throw std::runtime_error("Could not create session directory: " +
+                                 error.message());
+      }
+      session.clear();
+    }
+    if (session.empty()) {
+      throw std::runtime_error("Could not allocate a unique session directory");
+    }
+    std::filesystem::permissions(session, std::filesystem::perms::owner_all,
+                                 std::filesystem::perm_options::replace, error);
+    if (error) {
+      throw std::runtime_error("Could not protect session directory: " +
+                               error.message());
+    }
+    write_atomic(session / "request.md", request);
+    // Remember which project this session belongs to. Resuming from another
+    // directory would otherwise apply the saved prompt to the wrong files.
+    write_atomic(session / "project-root.txt", root.string() + "\n");
+    save_manifest(session, "request");
+    completed_stage = "request";
+  } else {
+    session = resume_session;
+    if (!std::filesystem::is_directory(session, error) || error) {
+      throw std::runtime_error("Session directory does not exist: " +
+                               session.string());
+    }
+    request = read_session_request(session);
+    std::string saved_root = read_text_file(session / "project-root.txt");
+    while (!saved_root.empty() &&
+           (saved_root.back() == '\n' || saved_root.back() == '\r')) {
+      saved_root.pop_back();
+    }
+    if (!saved_root.empty() && saved_root != root.string()) {
+      throw std::runtime_error("This session belongs to " + saved_root +
+                               ". Resume it from that directory.");
+    }
+    completed_stage =
+        parse_manifest_stage(read_text_file(session / "manifest.json"));
+    if (completed_stage == "finished") {
+      throw std::runtime_error("Session is already complete: " +
+                               session.filename().string());
+    }
+    if (stage_rank(completed_stage) == 0) {
+      // A truncated manifest must not strand the session. Keep the request and
+      // rebuild every derived stage.
+      save_manifest(session, "request");
+      completed_stage = "request";
+    }
+    status("Resuming session " + session.filename().string() +
+           ", continuing after saved stage " + completed_stage + ".");
   }
-  if (session.empty()) {
-    throw std::runtime_error("Could not allocate a unique session directory");
-  }
-  std::filesystem::permissions(session, std::filesystem::perms::owner_all,
-                               std::filesystem::perm_options::replace, error);
-  if (error) {
-    throw std::runtime_error("Could not protect session directory: " +
-                             error.message());
-  }
-  write_atomic(session / "request.md", request);
-  save_manifest(session, "request");
   throw_if_cancelled("the start");
 
-  status("Chief of Staff: " + config_.chief.model);
-  // The raw stream is on disk before the stage is considered done, so a
-  // resume can rebuild it; chief.md is derived from that recording.
-  const auto chief_raw_path = session / "chief" / "raw.jsonl";
-  {
-    RawRecorder recorder(chief_raw_path);
-    InferenceSession model(config_.chief, status);
-    ActiveSessionGuard active(active_session_, model);
-    model.generate({{"system", chief_instructions()}, {"user", request}},
-                   wrap_tokens(recorder, 0));
-    model.release();
+  bool chief_saved = stage_rank(completed_stage) >= stage_rank("chief");
+  std::string chief_content;
+  if (chief_saved) {
+    chief_content = read_text_file(session / "chief.md");
+    chief_saved = !chief_content.empty();
   }
-  const std::string chief_raw = read_raw_text(chief_raw_path, 0);
-  const auto chief = extract_thinking(chief_raw);
-  if (!chief.thinking.empty()) {
-    write_atomic(session / "chief_thinking.md", chief.thinking);
+  if (chief_saved) {
+    status("Chief of Staff: saved brief, skipping the model call.");
+  } else {
+    status("Chief of Staff: " + config_.chief.model);
+    // The raw stream is on disk before the stage is considered done, so a
+    // resume can rebuild it; chief.md is derived from that recording.
+    const auto chief_raw_path = session / "chief" / "raw.jsonl";
+    if (resuming) move_aside(chief_raw_path);
+    {
+      RawRecorder recorder(chief_raw_path);
+      InferenceSession model(config_.chief, status);
+      ActiveSessionGuard active(active_session_, model);
+      model.generate({{"system", chief_instructions()}, {"user", request}},
+                     wrap_tokens(recorder, 0));
+      model.release();
+    }
+    const std::string chief_raw = read_raw_text(chief_raw_path, 0);
+    const auto chief = extract_thinking(chief_raw);
+    if (!chief.thinking.empty()) {
+      write_atomic(session / "chief_thinking.md", chief.thinking);
+    }
+    write_atomic(session / "chief.md", chief.content);
+    save_manifest(session, "chief");
+    chief_content = chief.content;
   }
-  write_atomic(session / "chief.md", chief.content);
-  save_manifest(session, "chief");
 
-  const std::string prompt_input = "Original user request:\n" + request +
-                                   "\n\nChief of Staff brief:\n" + chief.content;
-  status("Prompter: " + config_.prompter.model);
-  const auto prompt_raw_path = session / "prompt" / "raw.jsonl";
-  {
-    RawRecorder recorder(prompt_raw_path);
-    InferenceSession model(config_.prompter, status);
-    ActiveSessionGuard active(active_session_, model);
-    model.generate({{"system", prompter_instructions()}, {"user", prompt_input}},
-                   wrap_tokens(recorder, 0));
-    model.release();
+  // A saved prompt is only valid while the saved Chief brief is the one it was
+  // built from. If the Chief had to run again, the Prompter must do so too.
+  bool prompter_saved =
+      chief_saved && stage_rank(completed_stage) >= stage_rank("prompter");
+  std::string prompt_content;
+  if (prompter_saved) {
+    prompt_content = read_text_file(session / "prompt.md");
+    prompter_saved = !prompt_content.empty();
   }
-  const std::string prompt_raw = read_raw_text(prompt_raw_path, 0);
-  const auto prompt = extract_thinking(prompt_raw);
-  if (!prompt.thinking.empty()) {
-    write_atomic(session / "prompt_thinking.md", prompt.thinking);
+  if (prompter_saved) {
+    status("Prompter: saved brief, skipping the model call.");
+  } else {
+    const std::string prompt_input = "Original user request:\n" + request +
+                                     "\n\nChief of Staff brief:\n" +
+                                     chief_content;
+    status("Prompter: " + config_.prompter.model);
+    const auto prompt_raw_path = session / "prompt" / "raw.jsonl";
+    if (resuming) move_aside(prompt_raw_path);
+    {
+      RawRecorder recorder(prompt_raw_path);
+      InferenceSession model(config_.prompter, status);
+      ActiveSessionGuard active(active_session_, model);
+      model.generate(
+          {{"system", prompter_instructions()}, {"user", prompt_input}},
+          wrap_tokens(recorder, 0));
+      model.release();
+    }
+    const std::string prompt_raw = read_raw_text(prompt_raw_path, 0);
+    const auto prompt = extract_thinking(prompt_raw);
+    if (!prompt.thinking.empty()) {
+      write_atomic(session / "prompt_thinking.md", prompt.thinking);
+    }
+    write_atomic(session / "prompt.md", prompt.content);
+    save_manifest(session, "prompter");
+    prompt_content = prompt.content;
   }
-  write_atomic(session / "prompt.md", prompt.content);
-  save_manifest(session, "prompter");
+
+  // This version has no structured Coder transcript yet, so a coder that was
+  // already running cannot continue mid-turn. Keep its old log (it may explain
+  // the failure) and let the Coder start over in the same session.
+  if (resuming) move_aside(session / "coder");
 
   const std::string coding_input =
       "Original user request:\n" + request + "\n\nDetailed implementation prompt:\n" +
-      prompt.content + "\n\n" + workspace_snapshot(root);
+      prompt_content + "\n\n" + workspace_snapshot(root);
   status("Coder: " + (config_.coder.model.empty() ? config_.coder.gguf_path
                                                    : config_.coder.model));
   Messages coder_messages = {{"system", coder_instructions()},
