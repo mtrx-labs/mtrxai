@@ -127,15 +127,27 @@ std::string safe_model_label(const std::string& model) {
 
 std::string prompt_api_model(const std::string& provider,
                              const std::string& base_url,
-                             const std::string& api_key) {
+                             std::string& api_key) {
   std::vector<std::string> models;
-  std::cout << "Fetching available models...\n";
-  try {
-    models = fetch_available_models(provider, base_url, api_key);
-  } catch (const std::exception& error) {
-    std::cout << "Could not fetch the model list: " << error.what() << '\n'
-              << "Enter a model ID manually.\n";
-    return prompt_line("Model name");
+  while (true) {
+    std::cout << "Fetching available models...\n";
+    try {
+      models = fetch_available_models(provider, base_url, api_key);
+      break;
+    } catch (const std::exception& error) {
+      std::cout << "Could not fetch the model list: " << error.what() << '\n'
+                << "  1. Try again with a different API key\n"
+                << "  0. Enter a model ID manually\n";
+      while (true) {
+        const std::string choice = prompt_line("Choose an option");
+        if (choice == "0") return prompt_line("Model name");
+        if (choice == "1") {
+          api_key = prompt_secret("API key (input is hidden)");
+          break;
+        }
+        std::cout << "Choose 1 to retry or 0 to enter a model ID manually.\n";
+      }
+    }
   }
   if (models.empty()) {
     std::cout << "The endpoint returned no models. Enter a model ID manually.\n";
@@ -257,6 +269,10 @@ void run_setup_wizard(const std::filesystem::path& path) {
             << "API keys are entered without echo and saved separately with "
                "owner-only permissions.\n"
             << "Press Ctrl-D at any prompt to cancel without saving.\n";
+  if (std::filesystem::exists(path)) {
+    std::cout << "An existing configuration and credentials file will be "
+                 "replaced after setup completes.\n";
+  }
 
   Config config;
   config.chief =

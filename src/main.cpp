@@ -51,10 +51,6 @@ int main(int argc, char** argv) {
       }
       if (argument == "--init") {
         const std::filesystem::path path = mtrxai::config_path();
-        if (std::filesystem::exists(path)) {
-          throw std::runtime_error("Configuration already exists: " +
-                                   path.string());
-        }
         mtrxai::run_setup_wizard(path);
         return 0;
       }

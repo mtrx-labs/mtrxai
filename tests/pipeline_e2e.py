@@ -62,19 +62,26 @@ def check_setup_wizard(binary, root):
     env = os.environ.copy()
     env.update({"HOME": str(user_home), "XDG_CONFIG_HOME": str(config_home), "TERM": "xterm"})
     openai_auth_seen = threading.Event()
+    corrected_openai_auth_seen = threading.Event()
     anthropic_auth_seen = threading.Event()
 
     class ModelListHandler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path.split("?", 1)[0] == "/v1/models" and self.headers.get("Authorization") == (
-                    "Bearer wizard-openai-secret"):
-                openai_auth_seen.set()
-                if "after=" in self.path:
-                    data = {"data": [{"id": "wizard-openai-model"}],
+            if self.path.split("?", 1)[0] == "/v1/models" and self.headers.get("Authorization") in (
+                    "Bearer wizard-openai-secret",
+                    "Bearer wizard-openai-corrected"):
+                if self.headers.get("Authorization") == "Bearer wizard-openai-corrected":
+                    corrected_openai_auth_seen.set()
+                    data = {"data": [{"id": "replacement-openai-model"}],
                             "has_more": False}
                 else:
-                    data = {"data": [{"id": "wizard-openai-first"}],
-                            "has_more": True, "last_id": "wizard-openai-first"}
+                    openai_auth_seen.set()
+                    if "after=" in self.path:
+                        data = {"data": [{"id": "wizard-openai-model"}],
+                                "has_more": False}
+                    else:
+                        data = {"data": [{"id": "wizard-openai-first"}],
+                                "has_more": True, "last_id": "wizard-openai-first"}
             elif (self.path.split("?", 1)[0] == "/v1/models" and
                   self.headers.get("x-api-key") == "wizard-anthropic-secret" and
                   self.headers.get("anthropic-version")):
@@ -214,6 +221,74 @@ def check_setup_wizard(binary, root):
                 ui.terminate()
                 ui.wait(timeout=3)
             os.close(ui_master)
+
+        # --init can be rerun to replace an existing setup. A mistyped API key
+        # can be corrected in the same wizard run without abandoning setup.
+        rewrite_master, rewrite_slave = open_sized_pty()
+        rewrite = subprocess.Popen(
+            [binary, "--init"], cwd=root, env=env,
+            stdin=rewrite_slave, stdout=rewrite_slave, stderr=rewrite_slave
+        )
+        os.close(rewrite_slave)
+        rewrite_output = bytearray()
+        rewrite_transcript = bytearray()
+
+        def wait_rewrite(needle, timeout=8):
+            target = needle.encode()
+            deadline = time.time() + timeout
+            while target not in rewrite_output and time.time() < deadline:
+                readable, _, _ = select.select([rewrite_master], [], [], 0.2)
+                if readable:
+                    try:
+                        received = os.read(rewrite_master, 8192)
+                        rewrite_output.extend(received)
+                        rewrite_transcript.extend(received)
+                    except OSError:
+                        break
+            assert target in rewrite_output, rewrite_output.decode(errors="replace")
+
+        def answer_rewrite(needle, value):
+            wait_rewrite(needle)
+            os.write(rewrite_master, value)
+            rewrite_output.clear()
+
+        try:
+            answer_rewrite("Choose a provider (1-4 or name)", b"2\n")
+            assert b"will be replaced" in rewrite_transcript
+            answer_rewrite("Ollama server URL", b"\n")
+            answer_rewrite("Ollama model name", b"replacement-ollama\n")
+            wait_rewrite("2 / 3")
+            answer_rewrite("Choose a provider (1-4 or name)", b"3\n")
+            answer_rewrite("OpenAI-compatible API base URL",
+                           f"http://127.0.0.1:{server.server_port}/v1\n".encode())
+            answer_rewrite("OpenAI API key (input is hidden)", b"wrong-key\n")
+            answer_rewrite("Try again with a different API key", b"1\n")
+            answer_rewrite("API key (input is hidden)",
+                           b"wizard-openai-corrected\n")
+            wait_rewrite("replacement-openai-model")
+            answer_rewrite("Select a model number", b"1\n")
+            wait_rewrite("3 / 3")
+            answer_rewrite("Choose a provider (1-4 or name)", b"1\n")
+            answer_rewrite("Path to GGUF model", b"~/models/chief.gguf\n")
+            wait_rewrite("Setup complete.")
+            assert drain_exit(rewrite, rewrite_master, 5) == 0
+            assert b"wrong-key" not in rewrite_transcript
+            assert b"wizard-openai-corrected" not in rewrite_transcript
+            assert corrected_openai_auth_seen.is_set()
+            rewritten = json.loads(config_path.read_text())
+            assert rewritten["chief"]["provider"] == "ollama"
+            assert rewritten["chief"]["model"] == "replacement-ollama"
+            assert rewritten["prompter"]["model"] == "replacement-openai-model"
+            assert rewritten["coder"]["provider"] == "gguf"
+            assert json.loads(credentials_path.read_text()) == {
+                "prompter": "wizard-openai-corrected"
+            }
+            assert stat.S_IMODE(credentials_path.stat().st_mode) == 0o600
+        finally:
+            if rewrite.poll() is None:
+                rewrite.terminate()
+                rewrite.wait(timeout=3)
+            os.close(rewrite_master)
     finally:
         if process.poll() is None:
             process.terminate()
