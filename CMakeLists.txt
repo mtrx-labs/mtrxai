@@ -95,6 +95,7 @@ set(CPACK_RPM_PACKAGE_GROUP "Development/Tools")
 include(CPack)
 
 if(BUILD_TESTING)
+  target_compile_definitions(mtrxai_core PRIVATE MTRXAI_ENABLE_TEST_HOOKS)
   set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
   include(FetchContent)
   FetchContent_Declare(

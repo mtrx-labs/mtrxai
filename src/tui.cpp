@@ -1445,6 +1445,12 @@ class Ui {
       return false;
     }
     if (event == Event::CtrlZ) return false;
+    if (event == Event::Custom && !screen_.GetSelection().empty()) {
+      // FTXUI posts a custom event after its selection callback. Treating it
+      // as handled clears the selection immediately after the mouse release.
+      pump();
+      return false;
+    }
     pump();
     if (review_active_) return handle_review(event);
     if (mode_ == Mode::notice) {

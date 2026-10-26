@@ -67,7 +67,28 @@ def check_setup_wizard(binary, root):
 
     class ModelListHandler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path.split("?", 1)[0] == "/v1/models" and self.headers.get("Authorization") in (
+            path = self.path.split("?", 1)[0]
+            auth = self.headers.get("Authorization")
+            if path.startswith("/v1/models/") and auth in (
+                    "Bearer wizard-openai-secret",
+                    "Bearer wizard-openai-corrected"):
+                model_id = path.rsplit("/", 1)[-1]
+                if model_id == "forbidden-openai-model":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                detail = {"id": model_id, "object": "model"}
+                if model_id == "blocked-openai-model":
+                    detail["permission"] = [{"allow_sampling": False,
+                                             "is_blocking": False}]
+                body = json.dumps(detail).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if path == "/v1/models" and auth in (
                     "Bearer wizard-openai-secret",
                     "Bearer wizard-openai-corrected"):
                 if self.headers.get("Authorization") == "Bearer wizard-openai-corrected":
@@ -80,9 +101,11 @@ def check_setup_wizard(binary, root):
                         data = {"data": [{"id": "wizard-openai-model"}],
                                 "has_more": False}
                     else:
-                        data = {"data": [{"id": "wizard-openai-first"}],
+                        data = {"data": [{"id": "wizard-openai-first"},
+                                          {"id": "forbidden-openai-model"},
+                                          {"id": "blocked-openai-model"}],
                                 "has_more": True, "last_id": "wizard-openai-first"}
-            elif (self.path.split("?", 1)[0] == "/v1/models" and
+            elif (path == "/v1/models" and
                   self.headers.get("x-api-key") == "wizard-anthropic-secret" and
                   self.headers.get("anthropic-version")):
                 anthropic_auth_seen.set()
@@ -104,6 +127,8 @@ def check_setup_wizard(binary, root):
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), ModelListHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    env["MTRXAI_TEST_OPENAI_BASE_URL"] = (
+        f"http://127.0.0.1:{server.server_port}/v1")
     master, slave = open_sized_pty()
     process = subprocess.Popen(
         [binary, "--init"], cwd=root, env=env,
@@ -137,10 +162,13 @@ def check_setup_wizard(binary, root):
         answer("Path to GGUF model", b"~/models/chief.gguf\n")
         wait_for("2 / 3")
         answer("Choose a provider (1-4 or name)", b"3\n")
-        answer("OpenAI-compatible API base URL",
-               f"http://127.0.0.1:{server.server_port}/v1\n".encode())
-        answer("OpenAI API key (input is hidden)", b"wizard-openai-secret\n")
+        wait_for("OpenAI API key (input is hidden)")
+        assert b"OpenAI-compatible API base URL" not in transcript
+        os.write(master, b"wizard-openai-secret\n")
+        output.clear()
         wait_for("wizard-openai-model")
+        assert b"forbidden-openai-model" not in transcript
+        assert b"blocked-openai-model" not in transcript
         answer("Select a model number", b"2\n")
         wait_for("3 / 3")
         answer("Choose a provider (1-4 or name)", b"4\n")
@@ -259,8 +287,6 @@ def check_setup_wizard(binary, root):
             answer_rewrite("Ollama model name", b"replacement-ollama\n")
             wait_rewrite("2 / 3")
             answer_rewrite("Choose a provider (1-4 or name)", b"3\n")
-            answer_rewrite("OpenAI-compatible API base URL",
-                           f"http://127.0.0.1:{server.server_port}/v1\n".encode())
             answer_rewrite("OpenAI API key (input is hidden)", b"wrong-key\n")
             answer_rewrite("Try again with a different API key", b"1\n")
             answer_rewrite("API key (input is hidden)",

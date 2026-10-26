@@ -238,8 +238,12 @@ ModelSlot configure_role(const std::string& name, const std::string& title,
       break;
     case ProviderChoice::openai:
       slot.provider = "openai";
-      slot.base_url = prompt_url("OpenAI-compatible API base URL",
-                                 "https://api.openai.com/v1");
+      slot.base_url = "https://api.openai.com/v1";
+#ifdef MTRXAI_ENABLE_TEST_HOOKS
+      if (const char* test_url = std::getenv("MTRXAI_TEST_OPENAI_BASE_URL")) {
+        if (*test_url != '\0') slot.base_url = test_url;
+      }
+#endif
       slot.api_key = prompt_secret("OpenAI API key (input is hidden)");
       slot.model = prompt_api_model(slot.provider, slot.base_url, slot.api_key);
       break;
