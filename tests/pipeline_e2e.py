@@ -61,6 +61,42 @@ def check_setup_wizard(binary, root):
     gguf.write_bytes(b"mock gguf")
     env = os.environ.copy()
     env.update({"HOME": str(user_home), "XDG_CONFIG_HOME": str(config_home), "TERM": "xterm"})
+    openai_auth_seen = threading.Event()
+    anthropic_auth_seen = threading.Event()
+
+    class ModelListHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.split("?", 1)[0] == "/v1/models" and self.headers.get("Authorization") == (
+                    "Bearer wizard-openai-secret"):
+                openai_auth_seen.set()
+                if "after=" in self.path:
+                    data = {"data": [{"id": "wizard-openai-model"}],
+                            "has_more": False}
+                else:
+                    data = {"data": [{"id": "wizard-openai-first"}],
+                            "has_more": True, "last_id": "wizard-openai-first"}
+            elif (self.path.split("?", 1)[0] == "/v1/models" and
+                  self.headers.get("x-api-key") == "wizard-anthropic-secret" and
+                  self.headers.get("anthropic-version")):
+                anthropic_auth_seen.set()
+                data = {"data": [{"id": "wizard-anthropic-model"}],
+                        "has_more": False}
+            else:
+                self.send_response(401)
+                self.end_headers()
+                return
+            body = json.dumps(data).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ModelListHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     master, slave = open_sized_pty()
     process = subprocess.Popen(
         [binary, "--init"], cwd=root, env=env,
@@ -94,18 +130,24 @@ def check_setup_wizard(binary, root):
         answer("Path to GGUF model", b"~/models/chief.gguf\n")
         wait_for("2 / 3")
         answer("Choose a provider (1-4 or name)", b"3\n")
-        answer("OpenAI-compatible API base URL", b"\n")
-        answer("OpenAI model name", b"wizard-openai-model\n")
+        answer("OpenAI-compatible API base URL",
+               f"http://127.0.0.1:{server.server_port}/v1\n".encode())
         answer("OpenAI API key (input is hidden)", b"wizard-openai-secret\n")
+        wait_for("wizard-openai-model")
+        answer("Select a model number", b"2\n")
         wait_for("3 / 3")
         answer("Choose a provider (1-4 or name)", b"4\n")
-        answer("Anthropic API base URL", b"\n")
-        answer("Anthropic model name", b"wizard-anthropic-model\n")
+        answer("Anthropic API base URL",
+               f"http://127.0.0.1:{server.server_port}\n".encode())
         answer("Anthropic API key (input is hidden)", b"wizard-anthropic-secret\n")
+        wait_for("wizard-anthropic-model")
+        answer("Select a model number", b"1\n")
         wait_for("Setup complete.")
         assert drain_exit(process, master, 5) == 0
         assert b"wizard-openai-secret" not in transcript
         assert b"wizard-anthropic-secret" not in transcript
+        assert openai_auth_seen.is_set()
+        assert anthropic_auth_seen.is_set()
         config_path = config_home / "mtrxai" / "config.json"
         config_text = config_path.read_text()
         config = json.loads(config_text)
@@ -113,7 +155,8 @@ def check_setup_wizard(binary, root):
         assert config["chief"]["gguf_path"] == str(gguf)
         assert config["prompter"]["provider"] == "openai"
         assert config["prompter"]["model"] == "wizard-openai-model"
-        assert config["prompter"]["base_url"] == "https://api.openai.com/v1"
+        assert config["prompter"]["base_url"] == (
+            f"http://127.0.0.1:{server.server_port}/v1")
         assert config["coder"]["provider"] == "anthropic"
         assert config["coder"]["model"] == "wizard-anthropic-model"
         assert "wizard-openai-secret" not in config_text
@@ -176,6 +219,8 @@ def check_setup_wizard(binary, root):
             process.terminate()
             process.wait(timeout=3)
         os.close(master)
+        server.shutdown()
+        server.server_close()
 
 
 def check_esc_cancellation(binary, root):

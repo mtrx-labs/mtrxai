@@ -254,6 +254,63 @@ HttpResponse post_json(const std::string& url, const std::string& body,
   return response;
 }
 
+HttpResponse get_json(const std::string& url,
+                      const std::vector<std::string>& extra_headers) {
+  validate_provider_endpoint(url);
+  CURL* curl = curl_easy_init();
+  if (curl == nullptr) throw std::runtime_error("Could not create model-list request");
+  HttpResponse response;
+  struct curl_slist* headers = nullptr;
+  headers = curl_slist_append(headers, "Accept: application/json");
+  for (const auto& header : extra_headers) {
+    headers = curl_slist_append(headers, header.c_str());
+  }
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+  curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, append_body);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+  const CURLcode result = curl_easy_perform(curl);
+  if (result == CURLE_OK)
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status);
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+  if (result != CURLE_OK) {
+    if (response.exceeded_limit)
+      throw std::runtime_error("Model list response exceeded the 4 MiB safety limit");
+    throw std::runtime_error(std::string("Model list request failed: ") +
+                             curl_easy_strerror(result));
+  }
+  if (response.status >= 300 && response.status < 400)
+    throw std::runtime_error("Model list endpoint returned a redirect; redirects are not followed");
+  if (response.status < 200 || response.status >= 300)
+    throw std::runtime_error("Model list endpoint returned HTTP " +
+                             std::to_string(response.status));
+  return response;
+}
+
+std::string json_string_field(json_object* object, const char* key) {
+  json_object* value = nullptr;
+  if (object == nullptr || !json_object_object_get_ex(object, key, &value) ||
+      !json_object_is_type(value, json_type_string)) {
+    return {};
+  }
+  return json_object_get_string(value);
+}
+
+std::string url_escape(CURL* curl, const std::string& value) {
+  char* escaped = curl_easy_escape(curl, value.c_str(),
+                                  static_cast<int>(value.size()));
+  if (escaped == nullptr) throw std::runtime_error("Could not encode model-list cursor");
+  std::string result(escaped);
+  curl_free(escaped);
+  return result;
+}
+
 std::string messages_json(const Messages& messages) {
   Json array(json_object_new_array());
   for (const auto& [role, content] : messages) {
@@ -609,6 +666,81 @@ std::string environment_key(const std::string& name) {
 }
 
 }  // namespace
+
+std::vector<std::string> fetch_available_models(
+    const std::string& provider, const std::string& base_url,
+    const std::string& api_key) {
+  if (provider != "openai" && provider != "anthropic") {
+    throw std::runtime_error("Model listing is supported for OpenAI-compatible and Anthropic providers");
+  }
+  if (api_key.empty()) throw std::runtime_error("An API key is required to list models");
+  validate_provider_endpoint(base_url);
+
+  std::string endpoint = normalize_url(base_url);
+  if (endpoint.size() < 3 || endpoint.substr(endpoint.size() - 3) != "/v1")
+    endpoint += "/v1";
+  endpoint += "/models";
+
+  std::vector<std::string> headers;
+  const bool anthropic = provider == "anthropic";
+  if (anthropic) {
+    headers = {"x-api-key: " + api_key,
+               "anthropic-version: 2023-06-01"};
+  } else {
+    headers = {"Authorization: Bearer " + api_key};
+  }
+
+  std::vector<std::string> models;
+  std::string cursor;
+  for (int page = 0; page < 100; ++page) {
+    std::string page_url = endpoint;
+    if (!cursor.empty()) {
+      CURL* encoder = curl_easy_init();
+      if (encoder == nullptr)
+        throw std::runtime_error("Could not create model-list request");
+      const std::string escaped = url_escape(encoder, cursor);
+      curl_easy_cleanup(encoder);
+      page_url += anthropic ? "?after_id=" : "?after=";
+      page_url += escaped;
+    }
+
+    const HttpResponse response = get_json(page_url, headers);
+    Json parsed(json_tokener_parse(response.body.c_str()));
+    if (!parsed || !json_object_is_type(parsed.get(), json_type_object))
+      throw std::runtime_error("Model list endpoint returned invalid JSON");
+
+    json_object* data = nullptr;
+    if (!json_object_object_get_ex(parsed.get(), "data", &data) ||
+        !json_object_is_type(data, json_type_array)) {
+      if (page == 0)
+        throw std::runtime_error("Model list response does not contain a data array");
+      break;
+    }
+    const std::size_t previous_count = models.size();
+    const std::size_t count = json_object_array_length(data);
+    for (std::size_t index = 0; index < count; ++index) {
+      json_object* item = json_object_array_get_idx(data, index);
+      const std::string id = json_string_field(item, "id");
+      if (!id.empty() &&
+          std::find(models.begin(), models.end(), id) == models.end()) {
+        models.push_back(id);
+        if (models.size() >= 5000)
+          throw std::runtime_error("Model list contains too many entries to display safely");
+      }
+    }
+
+    json_object* has_more_value = nullptr;
+    const bool has_more =
+        json_object_object_get_ex(parsed.get(), "has_more", &has_more_value) &&
+        json_object_is_type(has_more_value, json_type_boolean) &&
+        json_object_get_boolean(has_more_value);
+    if (!has_more) break;
+    cursor = json_string_field(parsed.get(), "last_id");
+    if (cursor.empty() || models.size() == previous_count)
+      throw std::runtime_error("Model list pagination did not advance");
+  }
+  return models;
+}
 
 struct InferenceSession::Impl {
   ModelSlot slot;
