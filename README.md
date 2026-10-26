@@ -64,7 +64,10 @@ preset disables LeakSanitizer because it cannot run reliably in the restricted
 terminal test environment; enable leak detection separately on a compatible
 host with `ASAN_OPTIONS=detect_leaks=1`.
 
-Run `mtrxai --init` in an interactive terminal to open the setup wizard. For
+Run `mtrxai --init` in an interactive terminal to open the setup wizard. It can
+be run again to replace the saved configuration and credentials. If model
+listing fails, the wizard lets you retry with a corrected API key or enter a
+model ID manually. For
 each role it offers GGUF, Ollama, OpenAI, and Anthropic. OpenAI-compatible and
 Anthropic endpoints use the API key to fetch model IDs for numbered selection;
 if the endpoint does not support model listing, a model ID can be entered
