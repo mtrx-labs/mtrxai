@@ -54,11 +54,12 @@ cmake --build build -j2
 Run `mtrxai --init` in an interactive terminal to open the setup wizard. It can
 be run again to replace the saved configuration and credentials. If model
 listing fails, the wizard lets you retry with a corrected API key or enter a
-model ID manually. For
-each role it offers GGUF, Ollama, OpenAI, and Anthropic. OpenAI-compatible and
-Anthropic endpoints use the API key to fetch model IDs for numbered selection;
-if the endpoint does not support model listing, a model ID can be entered
-manually. GGUF paths support
+model ID manually. For each role it offers GGUF, Ollama, OpenAI, and Anthropic.
+OpenAI uses `https://api.openai.com/v1` directly and checks listed model IDs
+against the authenticated model-detail endpoint, including sampling
+permissions when returned, before presenting choices.
+Anthropic uses its API key to fetch model IDs for numbered selection; if model
+listing is unavailable, a model ID can be entered manually. GGUF paths support
 `~` expansion and must point to a readable file. API-key entry is hidden.
 Keys are saved separately in `credentials.json` beside the config (by default
 `~/.config/mtrxai/credentials.json`) with owner-only permissions; they are not

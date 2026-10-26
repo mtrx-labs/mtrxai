@@ -255,7 +255,8 @@ HttpResponse post_json(const std::string& url, const std::string& body,
 }
 
 HttpResponse get_json(const std::string& url,
-                      const std::vector<std::string>& extra_headers) {
+                      const std::vector<std::string>& extra_headers,
+                      bool allow_model_unavailable = false) {
   validate_provider_endpoint(url);
   CURL* curl = curl_easy_init();
   if (curl == nullptr) throw std::runtime_error("Could not create model-list request");
@@ -287,6 +288,10 @@ HttpResponse get_json(const std::string& url,
   }
   if (response.status >= 300 && response.status < 400)
     throw std::runtime_error("Model list endpoint returned a redirect; redirects are not followed");
+  if (allow_model_unavailable &&
+      (response.status == 403 || response.status == 404)) {
+    return response;
+  }
   if (response.status < 200 || response.status >= 300)
     throw std::runtime_error("Model list endpoint returned HTTP " +
                              std::to_string(response.status));
@@ -300,6 +305,32 @@ std::string json_string_field(json_object* object, const char* key) {
     return {};
   }
   return json_object_get_string(value);
+}
+
+bool model_allows_sampling(json_object* model) {
+  json_object* permissions = nullptr;
+  if (!json_object_object_get_ex(model, "permission", &permissions) ||
+      permissions == nullptr ||
+      json_object_is_type(permissions, json_type_null)) {
+    return true;
+  }
+  if (!json_object_is_type(permissions, json_type_array)) return false;
+  const std::size_t count = json_object_array_length(permissions);
+  for (std::size_t index = 0; index < count; ++index) {
+    json_object* permission = json_object_array_get_idx(permissions, index);
+    json_object* sampling = nullptr;
+    json_object* blocking = nullptr;
+    if (permission != nullptr &&
+        json_object_object_get_ex(permission, "allow_sampling", &sampling) &&
+        json_object_is_type(sampling, json_type_boolean) &&
+        json_object_get_boolean(sampling) &&
+        (!json_object_object_get_ex(permission, "is_blocking", &blocking) ||
+         !json_object_is_type(blocking, json_type_boolean) ||
+         !json_object_get_boolean(blocking))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::string url_escape(CURL* curl, const std::string& value) {
@@ -724,8 +755,11 @@ std::vector<std::string> fetch_available_models(
       if (!id.empty() &&
           std::find(models.begin(), models.end(), id) == models.end()) {
         models.push_back(id);
-        if (models.size() >= 5000)
-          throw std::runtime_error("Model list contains too many entries to display safely");
+        const std::size_t max_models = anthropic ? 5000 : 250;
+        if (models.size() >= max_models) {
+          throw std::runtime_error(
+              "Model list contains too many entries to verify safely");
+        }
       }
     }
 
@@ -738,6 +772,29 @@ std::vector<std::string> fetch_available_models(
     cursor = json_string_field(parsed.get(), "last_id");
     if (cursor.empty() || models.size() == previous_count)
       throw std::runtime_error("Model list pagination did not advance");
+  }
+
+  if (!anthropic) {
+    // The list can include model IDs that this key cannot retrieve. Confirm
+    // each ID against the authenticated model-detail endpoint before showing it.
+    std::vector<std::string> accessible;
+    std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> encoder(
+        curl_easy_init(), curl_easy_cleanup);
+    if (!encoder)
+      throw std::runtime_error("Could not create model access check");
+    for (const auto& id : models) {
+      const std::string escaped = url_escape(encoder.get(), id);
+      const HttpResponse detail =
+          get_json(endpoint + "/" + escaped, headers, true);
+      if (detail.status == 403 || detail.status == 404) continue;
+      Json parsed(json_tokener_parse(detail.body.c_str()));
+      if (!parsed || !json_object_is_type(parsed.get(), json_type_object))
+        continue;
+      if (json_string_field(parsed.get(), "id") == id &&
+          model_allows_sampling(parsed.get()))
+        accessible.push_back(id);
+    }
+    models = std::move(accessible);
   }
   return models;
 }
