@@ -1,4 +1,5 @@
 #include "mtrxai/config.hpp"
+#include "mtrxai/endpoint.hpp"
 
 #include "mtrxai/files.hpp"
 
@@ -101,10 +102,12 @@ std::string prompt_secret(const std::string& label) {
 std::string prompt_url(const std::string& label, const std::string& fallback) {
   while (true) {
     auto value = prompt_line(label, fallback);
-    if (value.rfind("https://", 0) == 0 || value.rfind("http://", 0) == 0) {
+    try {
+      validate_provider_endpoint(value);
       return value;
+    } catch (const std::exception& error) {
+      std::cout << error.what() << '\n';
     }
-    std::cout << "Enter a URL beginning with http:// or https://.\n";
   }
 }
 

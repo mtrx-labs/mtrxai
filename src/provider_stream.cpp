@@ -179,17 +179,44 @@ void ReplayParser::line(const std::string& line_value,
     if (trim(line_value).empty()) return;
     payload = line_value;
   } else {
+    if (line_value.compare(0, 6, "event:") == 0) {
+      event_ = trim(line_value.substr(6));
+      return;
+    }
     payload = sse_data(line_value);
-    if (payload.empty() || payload == "[DONE]") return;
+    if (payload.empty() || payload == "[DONE]") {
+      if (payload == "[DONE]") event_.clear();
+      return;
+    }
   }
 
   Json parsed(json_tokener_parse(payload.c_str()));
-  if (!parsed) return;
-  const std::string issue = json_error(parsed.get());
-  if (!issue.empty()) {
-    if (result_.content.empty()) error_ = issue;
+  if (!parsed) {
+    error_ = "Malformed provider stream payload";
     return;
   }
+  const std::string issue = json_error(parsed.get());
+  if (!issue.empty()) {
+    if (error_.empty()) error_ = issue.substr(0, 500);
+    return;
+  }
+  if (kind_ != ProviderKind::Ollama &&
+      (event_ == "error" || field(parsed.get(), "type") == "error")) {
+    json_object* error = nullptr;
+    std::string message;
+    if (json_object_object_get_ex(parsed.get(), "error", &error)) {
+      message = json_object_is_type(error, json_type_string)
+                    ? json_object_get_string(error) : field(error, "message");
+    }
+    if (message.empty()) message = field(parsed.get(), "message");
+    if (error_.empty()) {
+      error_ = message.empty() ? "Provider reported a stream error"
+                               : message.substr(0, 500);
+    }
+    event_.clear();
+    return;
+  }
+  event_.clear();
 
   if (kind_ == ProviderKind::Ollama) {
     json_object* message = nullptr;

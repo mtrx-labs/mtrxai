@@ -21,6 +21,14 @@ Each role can use a different Ollama model, OpenAI, Anthropic, or a local GGUF
 file. Provider and model choices are made during setup rather than tied to
 machine-specific defaults.
 
+Remote provider endpoints must use HTTPS. Plain HTTP is allowed only for
+loopback hosts (`localhost`, `127.0.0.1`, and `::1`). Endpoint URLs with
+embedded usernames or passwords and remote HTTP URLs are rejected from setup,
+TUI edits, configuration files, and immediately before requests. Provider
+requests do not follow redirects. A failed provider stream remains failed even
+if it already yielded partial text; its exact raw response is retained in the
+session for diagnosis and resume.
+
 **A single-model-at-a-time strategy reduces peak RAM, but cannot make an
 oversized model fit.** The supplied Mellum Q6 GGUF is about 11 GB; on a 16 GB
 machine it may leave too little memory for the OS and inference runtime. The
@@ -32,12 +40,12 @@ never copied or modified by mtrxAI.
 ## Build (Linux)
 
 Dependencies: C++17 compiler, CMake 3.20+, libcurl, OpenSSL, json-c, and
-pkg-config. CMake downloads the pinned FTXUI release (MIT) during the first
-configure (and doctest when tests are enabled), so that configure needs network
-access; later builds use the downloaded copies.
+pkg-config. FTXUI v7.0.3 is included in `third_party/ftxui`, so a normal build
+does not download dependencies. The `debug` branch also includes doctest and
+builds tests offline.
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
 cmake --build build -j2
 ./build/mtrxai --init
 ./build/mtrxai

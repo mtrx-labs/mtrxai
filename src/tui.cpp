@@ -1,8 +1,9 @@
 #include "mtrxai/tui.hpp"
 
+#include "mtrxai/cancel.hpp"
+#include "mtrxai/endpoint.hpp"
 #include "mtrxai/pipeline.hpp"
 #include "mtrxai/session.hpp"
-#include "mtrxai/cancel.hpp"
 #include "mtrxai/signals.hpp"
 #include "mtrxai/utf8.hpp"
 
@@ -363,7 +364,14 @@ CommandResult execute_command(Config& config,
       return {"Usage: " + name + " ROLE VALUE", {}};
     }
     auto& slot = find_slot(config, role);
-    if (name == "/endpoint") slot.base_url = value;
+    if (name == "/endpoint") {
+      try {
+        validate_provider_endpoint(value);
+      } catch (const std::exception& error) {
+        return {error.what(), {}};
+      }
+      slot.base_url = value;
+    }
     if (name == "/keyenv") slot.api_key_env = value;
     if (name == "/gguf") {
       slot.provider = "gguf";

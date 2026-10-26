@@ -40,6 +40,7 @@ class ReplayParser {
 
   ProviderKind kind_;
   std::string pending_;
+  std::string event_;
   std::string text_pending_;
   ReplayResult result_;
   std::string error_;

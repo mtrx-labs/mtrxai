@@ -48,9 +48,8 @@ needs network access.
 **Known risks / not run.** Real Ollama/GGUF and real Anthropic streaming were not run;
 their protocols are covered by unit tests and mock servers.
 
-**Merge status.** Phase 0 and Phase 1 implementation work is present in local
-commits, but neither is contained in `origin/main` as of the verified remote
-head `5c1b08b`; they are not merged upstream yet.
+**Merge status.** This historical merge status described the earlier local
+branch and has since been superseded by the current `main` history.
 
 ## Phase 2 — raw streams and replay
 
@@ -78,6 +77,10 @@ the FTXUI rewrite predate these changes in this checkout. FTXUI remains pinned
 to v7.0.3 in that pre-existing commit; this Phase 2 commit does not modify
 FTXUI. Phase 4 still requires v6.1.9.
 
-**Next.** The Phase 3 session/resume work is already present in the base
-history; review it as a separate phase after Phase 0/1 are merged. Then handle
-the FTXUI version and remaining Phase 4 requirements.
+## Security and provider error handling
+
+Remote endpoints require HTTPS; HTTP is accepted only for loopback. Validation
+is shared by setup, config load/save, TUI endpoint edits, and each provider
+request. Provider requests do not follow redirects. The shared raw-stream
+parser treats provider error payloads as terminal even after partial content
+or reasoning, while the pipeline saves exact response bytes before parsing.

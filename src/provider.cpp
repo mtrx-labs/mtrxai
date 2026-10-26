@@ -1,4 +1,5 @@
 #include "mtrxai/provider.hpp"
+#include "mtrxai/endpoint.hpp"
 #include "mtrxai/cancel.hpp"
 #include "mtrxai/provider_stream.hpp"
 #include "mtrxai/signals.hpp"
@@ -151,7 +152,9 @@ void post_json_stream(
   for (const auto& header : extra_headers) {
     headers = curl_slist_append(headers, header.c_str());
   }
+  validate_provider_endpoint(url);
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
   curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stream_bytes);
@@ -181,6 +184,8 @@ void post_json_stream(
                              curl_easy_strerror(result));
   }
   if (status < 200 || status >= 300) {
+    if (status >= 300 && status < 400)
+      throw std::runtime_error("Model server returned HTTP redirect " + std::to_string(status) + "; redirects are not followed for provider requests");
     throw std::runtime_error("Model server returned HTTP " +
                              std::to_string(status) + " during streaming");
   }
@@ -219,7 +224,9 @@ HttpResponse post_json(const std::string& url, const std::string& body,
   for (const auto& header : extra_headers) {
     headers = curl_slist_append(headers, header.c_str());
   }
+  validate_provider_endpoint(url);
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
   curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, append_body);
@@ -238,6 +245,8 @@ HttpResponse post_json(const std::string& url, const std::string& body,
                              curl_easy_strerror(result));
   }
   if (response.status < 200 || response.status >= 300) {
+    if (response.status >= 300 && response.status < 400)
+      throw std::runtime_error("Model server returned HTTP redirect " + std::to_string(response.status) + "; redirects are not followed for provider requests");
     throw std::runtime_error("Model server returned HTTP " +
                              std::to_string(response.status) + ": " +
                              response.body.substr(0, 1000));

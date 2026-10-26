@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(mtrxai VERSION 0.2.2 LANGUAGES CXX)
 
+option(BUILD_TESTING "Build project tests" OFF)
 include(CTest)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -16,9 +17,7 @@ find_package(OpenSSL REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(JSONC REQUIRED IMPORTED_TARGET json-c)
 
-# FTXUI supplies the terminal widgets, layout, and input handling for the TUI.
-# Pin a release so builds do not drift; the first configure downloads it, just
-# like doctest below.
+# FTXUI is vendored so the normal application build does not need network access.
 set(FTXUI_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(FTXUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(FTXUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -26,9 +25,7 @@ set(FTXUI_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
 include(FetchContent)
 FetchContent_Declare(
   ftxui
-  GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI.git
-  GIT_TAG v7.0.3
-  GIT_SHALLOW TRUE
+  SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ftxui"
 )
 FetchContent_MakeAvailable(ftxui)
 
@@ -36,6 +33,7 @@ add_library(mtrxai_core STATIC
   src/cancel.cpp
   src/coder_transcript.cpp
   src/config.cpp
+  src/endpoint.cpp
   src/files.cpp
   src/pipeline.cpp
   src/provider.cpp

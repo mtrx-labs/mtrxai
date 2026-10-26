@@ -9,6 +9,7 @@
 
 #include "mtrxai/cancel.hpp"
 #include "mtrxai/coder_transcript.hpp"
+#include "mtrxai/endpoint.hpp"
 #include "mtrxai/files.hpp"
 #include "mtrxai/pipeline.hpp"
 #include "mtrxai/provider.hpp"
@@ -168,6 +169,47 @@ TEST_CASE("ModelSlot defaults max_tokens to 4096") {
   CHECK(slot.max_tokens == 4096);
 }
 
+TEST_CASE("provider endpoints enforce HTTPS or loopback HTTP") {
+  CHECK_NOTHROW(mtrxai::validate_provider_endpoint("https://API.Example.com/v1"));
+  CHECK_NOTHROW(mtrxai::validate_provider_endpoint("http://localhost:11434"));
+  CHECK_NOTHROW(mtrxai::validate_provider_endpoint("http://LOCALHOST.:11434"));
+  CHECK_NOTHROW(mtrxai::validate_provider_endpoint("http://127.0.0.1:11434"));
+  CHECK_NOTHROW(mtrxai::validate_provider_endpoint("http://[::1]:11434"));
+  CHECK_THROWS(mtrxai::validate_provider_endpoint("http://example.com/v1"));
+  CHECK_THROWS(mtrxai::validate_provider_endpoint("http://localhost.attacker.example"));
+  CHECK_THROWS(mtrxai::validate_provider_endpoint("http://127.0.0.1.attacker.example"));
+  CHECK_THROWS(mtrxai::validate_provider_endpoint("http://localhost.."));
+  CHECK_THROWS(mtrxai::validate_provider_endpoint("https://user:pass@example.com"));
+  CHECK_THROWS(mtrxai::validate_provider_endpoint("ftp://example.com"));
+  CHECK_THROWS(mtrxai::validate_provider_endpoint("https:///missing-host"));
+}
+
+TEST_CASE("provider stream errors stay terminal after partial output") {
+  struct Case { mtrxai::ProviderKind kind; std::string raw; };
+  const std::vector<Case> cases = {
+      {mtrxai::ProviderKind::Ollama,
+       "{\"message\":{\"content\":\"partial\"}}\n{\"error\":\"server failed\"}\n"},
+      {mtrxai::ProviderKind::OpenAI,
+       "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n"
+       "data: {\"error\":{\"message\":\"server failed\"}}\n\n"},
+      {mtrxai::ProviderKind::Anthropic,
+       "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n"
+       "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"server failed\"}}\n\n"},
+  };
+  for (const auto& test : cases) {
+    mtrxai::ReplayParser live(test.kind);
+    live.append(test.raw.substr(0, 13), {});
+    live.append(test.raw.substr(13), {});
+    CHECK_THROWS_WITH(live.finish({}), doctest::Contains("server failed"));
+    CHECK_THROWS_WITH(mtrxai::replay(test.raw, test.kind),
+                      doctest::Contains("server failed"));
+  }
+  const std::string before_content =
+      "data: {\"error\":\"failed early\"}\n\n";
+  CHECK_THROWS_WITH(mtrxai::replay(before_content, mtrxai::ProviderKind::OpenAI),
+                    doctest::Contains("failed early"));
+}
+
 TEST_CASE("signals state tracking methods operate safely") {
   mtrxai::signals::set_active_child(12345);
   mtrxai::signals::set_active_child(0);
@@ -185,10 +227,13 @@ TEST_CASE("Config defaults and serialization of turns, timeout, and context") {
   config.coder.context_size = 4096;
   config.chief.provider = "ollama";
   config.chief.model = "chief-m";
+  config.chief.base_url = "http://localhost:11434";
   config.prompter.provider = "ollama";
   config.prompter.model = "prompter-m";
+  config.prompter.base_url = "http://localhost:11434";
   config.coder.provider = "ollama";
   config.coder.model = "coder-m";
+  config.coder.base_url = "http://localhost:11434";
 
   const auto temp_config_path =
       std::filesystem::temp_directory_path() / "mtrxai_test_config.json";
@@ -220,6 +265,22 @@ TEST_CASE("old configs without max_tokens still load with defaults") {
   CHECK(config.coder.max_tokens == 4096);
   CHECK(config.max_turns == 40);
   CHECK(config.gguf_load_timeout_seconds == 150);
+  std::filesystem::remove(path);
+}
+
+TEST_CASE("manually edited config cannot select remote plaintext HTTP") {
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("mtrxai_insecure_config_" + std::to_string(::getpid()) +
+                     ".json");
+  {
+    std::ofstream output(path);
+    output << R"({
+      "chief":{"provider":"openai","model":"c","base_url":"http://api.example/v1"},
+      "prompter":{"provider":"ollama","model":"p","base_url":"http://localhost:11434"},
+      "coder":{"provider":"ollama","model":"x","base_url":"http://127.0.0.1:11434"}
+    })";
+  }
+  CHECK_THROWS_WITH(mtrxai::load_config(path), doctest::Contains("plaintext"));
   std::filesystem::remove(path);
 }
 

@@ -1,5 +1,6 @@
 #include "mtrxai/config.hpp"
 #include "mtrxai/files.hpp"
+#include "mtrxai/endpoint.hpp"
 
 #include <json-c/json.h>
 
@@ -171,6 +172,9 @@ Config load_config(const std::filesystem::path& path) {
   }
   Config config{parse_slot("chief", root.get()), parse_slot("prompter", root.get()),
                 parse_slot("coder", root.get())};
+  for (const auto* slot : {&config.chief, &config.prompter, &config.coder}) {
+    if (slot->provider != "gguf") validate_provider_endpoint(slot->base_url);
+  }
   json_object* max_turns = nullptr;
   if (json_object_object_get_ex(root.get(), "max_turns", &max_turns) &&
       json_object_is_type(max_turns, json_type_int)) {
@@ -191,6 +195,9 @@ Config load_config(const std::filesystem::path& path) {
 }
 
 void save_config(const Config& config, const std::filesystem::path& path) {
+  for (const auto* slot : {&config.chief, &config.prompter, &config.coder}) {
+    if (slot->provider != "gguf") validate_provider_endpoint(slot->base_url);
+  }
   Json root(json_object_new_object());
   json_object_object_add(root.get(), "chief", slot_json(config.chief).release());
   json_object_object_add(root.get(), "prompter",

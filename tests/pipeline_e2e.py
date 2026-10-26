@@ -1071,10 +1071,178 @@ def check_signal_handling(binary, root):
         os.close(master)
 
 
+def check_provider_error_keeps_partial_raw_only(binary, root):
+    """A terminal stream error must keep raw bytes but commit no stage."""
+    workspace = root / "provider-error-workspace"
+    workspace.mkdir()
+    seen = threading.Event()
+    response = (b'{"message":{"content":"partial chief text"}}\n'
+                b'{"error":"forced provider failure"}\n')
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            seen.set()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.end_headers()
+            self.wfile.write(response)
+            self.wfile.flush()
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    config_home = root / "provider-error-config"
+    config_path = config_home / "mtrxai" / "config.json"
+    config_path.parent.mkdir(parents=True)
+    config = {
+        role: {"provider": "ollama", "model": role,
+               "base_url": f"http://127.0.0.1:{server.server_port}"}
+        for role in ("chief", "prompter", "coder")
+    }
+    config_path.write_text(json.dumps(config))
+    env = os.environ.copy()
+    state_home = root / "provider-error-state"
+    env.update({"XDG_CONFIG_HOME": str(config_home),
+                "XDG_STATE_HOME": str(state_home), "TERM": "xterm"})
+    master, slave = open_sized_pty()
+    process = subprocess.Popen([binary, "--no-update-check"], cwd=workspace,
+                               env=env, stdin=slave, stdout=slave, stderr=slave)
+    os.close(slave)
+    output = bytearray()
+
+    def wait_for(needle, timeout=12):
+        target = needle.encode()
+        deadline = time.time() + timeout
+        while target not in output and time.time() < deadline:
+            readable, _, _ = select.select([master], [], [], 0.2)
+            if readable:
+                try:
+                    output.extend(os.read(master, 8192))
+                except OSError:
+                    break
+        assert target in output, output.decode(errors="replace")[-3000:]
+
+    try:
+        wait_for("Describe what you want to build")
+        os.write(master, b"trigger partial provider failure\n")
+        wait_for("forced provider failure")
+        assert seen.is_set()
+        output.clear()
+        os.write(master, b"\x0e")  # leave the completed failed run
+        wait_for("Describe what you want to build")
+        os.write(master, b"/quit\n")
+        assert drain_exit(process, master, 5) == 0
+        sessions = list((state_home / "mtrxai" / "sessions").iterdir())
+        assert len(sessions) == 1
+        session = sessions[0]
+        assert (session / "chief" / "call-1.raw").read_bytes() == response
+        assert not (session / "chief.md").exists()
+        manifest = json.loads((session / "manifest.json").read_text())
+        assert manifest["completed_stage"] != "finished", manifest
+    finally:
+        server.shutdown()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        os.close(master)
+
+
+def check_provider_redirect_is_not_followed(binary, root):
+    """A credentialed request must stop at its first HTTP redirect."""
+    workspace = root / "provider-redirect-workspace"
+    workspace.mkdir()
+    redirect_seen = threading.Event()
+    destination_seen = threading.Event()
+
+    class Destination(BaseHTTPRequestHandler):
+        def do_POST(self):
+            destination_seen.set()
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    destination = ThreadingHTTPServer(("127.0.0.1", 0), Destination)
+    threading.Thread(target=destination.serve_forever, daemon=True).start()
+
+    class Redirect(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            assert self.headers.get("Authorization") == "Bearer redirect-test-key"
+            redirect_seen.set()
+            self.send_response(307)
+            self.send_header("Location", f"http://127.0.0.1:{destination.server_port}/leak")
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    source = ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+    threading.Thread(target=source.serve_forever, daemon=True).start()
+    config_home = root / "provider-redirect-config"
+    config_path = config_home / "mtrxai" / "config.json"
+    config_path.parent.mkdir(parents=True)
+    config = {
+        role: {"provider": "openai", "model": role,
+               "base_url": f"http://127.0.0.1:{source.server_port}/v1"}
+        for role in ("chief", "prompter", "coder")
+    }
+    config_path.write_text(json.dumps(config))
+    credentials = config_path.parent / "credentials.json"
+    credentials.write_text(json.dumps({role: "redirect-test-key" for role in config}))
+    credentials.chmod(0o600)
+    env = os.environ.copy()
+    state_home = root / "provider-redirect-state"
+    env.update({"XDG_CONFIG_HOME": str(config_home),
+                "XDG_STATE_HOME": str(state_home), "TERM": "xterm"})
+    master, slave = open_sized_pty()
+    process = subprocess.Popen([binary, "--no-update-check"], cwd=workspace,
+                               env=env, stdin=slave, stdout=slave, stderr=slave)
+    os.close(slave)
+    output = bytearray()
+
+    def wait_for(needle, timeout=12):
+        target = needle.encode()
+        deadline = time.time() + timeout
+        while target not in output and time.time() < deadline:
+            readable, _, _ = select.select([master], [], [], 0.2)
+            if readable:
+                try:
+                    output.extend(os.read(master, 8192))
+                except OSError:
+                    break
+        assert target in output, output.decode(errors="replace")[-3000:]
+
+    try:
+        wait_for("Describe what you want to build")
+        os.write(master, b"trigger redirect test\n")
+        wait_for("redirect 307")
+        assert redirect_seen.is_set()
+        assert not destination_seen.wait(timeout=0.5)
+        os.write(master, b"\x0e")
+        output.clear()
+        wait_for("Describe what you want to build")
+        os.write(master, b"/quit\n")
+        assert drain_exit(process, master, 5) == 0
+    finally:
+        source.shutdown()
+        destination.shutdown()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        os.close(master)
+
+
 def run(binary):
     temp = Path(tempfile.mkdtemp(prefix="mtrxai-e2e-"))
     check_setup_wizard(binary, temp)
     check_signal_handling(binary, temp)
+    check_provider_error_keeps_partial_raw_only(binary, temp)
+    check_provider_redirect_is_not_followed(binary, temp)
     check_esc_cancellation(binary, temp)
     check_resume(binary, temp)
     workspace = temp / "workspace"
