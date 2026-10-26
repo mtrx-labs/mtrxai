@@ -27,6 +27,12 @@ class Cancelled : public std::runtime_error {
 
 std::filesystem::path llama_log_path(const std::string& role);
 
+// Fetch model IDs from an OpenAI-compatible or Anthropic API endpoint.
+// Authentication headers are used only for this request and never returned.
+std::vector<std::string> fetch_available_models(
+    const std::string& provider, const std::string& base_url,
+    const std::string& api_key);
+
 class InferenceSession {
  public:
   using Status = std::function<void(const std::string&)>;

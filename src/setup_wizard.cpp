@@ -1,5 +1,6 @@
 #include "mtrxai/config.hpp"
 #include "mtrxai/endpoint.hpp"
+#include "mtrxai/provider.hpp"
 
 #include "mtrxai/files.hpp"
 
@@ -14,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace mtrxai {
 namespace {
@@ -111,6 +113,57 @@ std::string prompt_url(const std::string& label, const std::string& fallback) {
   }
 }
 
+std::string safe_model_label(const std::string& model) {
+  constexpr std::size_t max_label = 160;
+  std::string safe;
+  safe.reserve(std::min(model.size(), max_label));
+  for (unsigned char byte : model) {
+    if (safe.size() == max_label) break;
+    safe.push_back(byte < 0x20 || byte == 0x7f ? '?' : static_cast<char>(byte));
+  }
+  if (model.size() > max_label) safe += "...";
+  return safe;
+}
+
+std::string prompt_api_model(const std::string& provider,
+                             const std::string& base_url,
+                             const std::string& api_key) {
+  std::vector<std::string> models;
+  std::cout << "Fetching available models...\n";
+  try {
+    models = fetch_available_models(provider, base_url, api_key);
+  } catch (const std::exception& error) {
+    std::cout << "Could not fetch the model list: " << error.what() << '\n'
+              << "Enter a model ID manually.\n";
+    return prompt_line("Model name");
+  }
+  if (models.empty()) {
+    std::cout << "The endpoint returned no models. Enter a model ID manually.\n";
+    return prompt_line("Model name");
+  }
+
+  std::cout << "Available models:\n";
+  for (std::size_t index = 0; index < models.size(); ++index) {
+    std::cout << "  " << (index + 1) << ". "
+              << safe_model_label(models[index]) << '\n';
+  }
+  std::cout << "  0. Enter a model ID manually\n";
+  while (true) {
+    const std::string choice = prompt_line("Select a model number");
+    if (choice == "0") return prompt_line("Model name");
+    try {
+      std::size_t consumed = 0;
+      const unsigned long selected = std::stoul(choice, &consumed);
+      if (consumed == choice.size() && selected > 0 &&
+          selected <= models.size()) {
+        return models[selected - 1];
+      }
+    } catch (const std::exception&) {
+    }
+    std::cout << "Choose a listed number or 0 to enter a model ID manually.\n";
+  }
+}
+
 ProviderChoice prompt_provider(const std::string& role) {
   std::cout << "\n" << role << "\n"
             << "  1. GGUF       Local model file via llama.cpp\n"
@@ -175,15 +228,15 @@ ModelSlot configure_role(const std::string& name, const std::string& title,
       slot.provider = "openai";
       slot.base_url = prompt_url("OpenAI-compatible API base URL",
                                  "https://api.openai.com/v1");
-      slot.model = prompt_line("OpenAI model name");
       slot.api_key = prompt_secret("OpenAI API key (input is hidden)");
+      slot.model = prompt_api_model(slot.provider, slot.base_url, slot.api_key);
       break;
     case ProviderChoice::anthropic:
       slot.provider = "anthropic";
       slot.base_url =
           prompt_url("Anthropic API base URL", "https://api.anthropic.com");
-      slot.model = prompt_line("Anthropic model name");
       slot.api_key = prompt_secret("Anthropic API key (input is hidden)");
+      slot.model = prompt_api_model(slot.provider, slot.base_url, slot.api_key);
       break;
   }
   return slot;
