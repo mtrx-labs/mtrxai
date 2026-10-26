@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(mtrxai VERSION 0.2.2 LANGUAGES CXX)
 
-option(BUILD_TESTING "Build project tests" OFF)
+option(BUILD_TESTING "Build project tests" ON)
 include(CTest)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -16,6 +16,16 @@ find_package(CURL REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(JSONC REQUIRED IMPORTED_TARGET json-c)
+
+option(MTRXAI_ENABLE_SANITIZERS "Enable AddressSanitizer and UBSan" OFF)
+if(MTRXAI_ENABLE_SANITIZERS)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address,undefined)
+  else()
+    message(FATAL_ERROR "MTRXAI_ENABLE_SANITIZERS requires GCC or Clang")
+  endif()
+endif()
 
 # FTXUI is vendored so the normal application build does not need network access.
 set(FTXUI_BUILD_DOCS OFF CACHE BOOL "" FORCE)
@@ -89,8 +99,7 @@ if(BUILD_TESTING)
   include(FetchContent)
   FetchContent_Declare(
     doctest
-    GIT_REPOSITORY https://github.com/doctest/doctest.git
-    GIT_TAG v2.4.12
+    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/doctest"
   )
   FetchContent_MakeAvailable(doctest)
 

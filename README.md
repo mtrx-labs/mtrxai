@@ -51,6 +51,19 @@ cmake --build build -j2
 ./build/mtrxai
 ```
 
+The `debug` branch includes doctest and has an offline sanitizer preset:
+
+```sh
+cmake --preset debug
+cmake --build --preset debug -j2
+ctest --preset debug
+```
+
+The preset enables AddressSanitizer and UndefinedBehaviorSanitizer. Its test
+preset disables LeakSanitizer because it cannot run reliably in the restricted
+terminal test environment; enable leak detection separately on a compatible
+host with `ASAN_OPTIONS=detect_leaks=1`.
+
 Run `mtrxai --init` in an interactive terminal to open the setup wizard. For
 each role it offers GGUF, Ollama, OpenAI, and Anthropic and asks for the
 provider-specific model, endpoint, file path, or API key. GGUF paths support
