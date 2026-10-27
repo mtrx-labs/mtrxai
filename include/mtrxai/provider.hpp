@@ -31,7 +31,7 @@ std::filesystem::path llama_log_path(const std::string& role);
 // Authentication headers are used only for this request and never returned.
 std::vector<std::string> fetch_available_models(
     const std::string& provider, const std::string& base_url,
-    const std::string& api_key);
+    const std::string& api_key, bool verify_openai_model_access = true);
 
 class InferenceSession {
  public:

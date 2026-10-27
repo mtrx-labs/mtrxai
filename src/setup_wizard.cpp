@@ -20,7 +20,7 @@
 namespace mtrxai {
 namespace {
 
-enum class ProviderChoice { gguf = 1, ollama, openai, anthropic };
+enum class ProviderChoice { gguf = 1, ollama, openai, anthropic, openai_compatible };
 
 class EchoGuard {
  public:
@@ -127,12 +127,14 @@ std::string safe_model_label(const std::string& model) {
 
 std::string prompt_api_model(const std::string& provider,
                              const std::string& base_url,
-                             std::string& api_key) {
+                             std::string& api_key,
+                             bool verify_openai_model_access = true) {
   std::vector<std::string> models;
   while (true) {
     std::cout << "Fetching available models...\n";
     try {
-      models = fetch_available_models(provider, base_url, api_key);
+      models = fetch_available_models(provider, base_url, api_key,
+                                      verify_openai_model_access);
       break;
     } catch (const std::exception& error) {
       std::cout << "Could not fetch the model list: " << error.what() << '\n'
@@ -181,14 +183,19 @@ ProviderChoice prompt_provider(const std::string& role) {
             << "  1. GGUF       Local model file via llama.cpp\n"
             << "  2. Ollama     Local Ollama model\n"
             << "  3. OpenAI     OpenAI API\n"
-            << "  4. Anthropic  Anthropic Messages API\n";
+            << "  4. Anthropic  Anthropic Messages API\n"
+            << "  5. Custom     OpenAI-compatible API with custom URL and key\n";
   while (true) {
-    const auto choice = lower(prompt_line("Choose a provider (1-4 or name)"));
+    const auto choice = lower(prompt_line("Choose a provider (1-5 or name)"));
     if (choice == "1" || choice == "gguf") return ProviderChoice::gguf;
     if (choice == "2" || choice == "ollama") return ProviderChoice::ollama;
     if (choice == "3" || choice == "openai") return ProviderChoice::openai;
     if (choice == "4" || choice == "anthropic") return ProviderChoice::anthropic;
-    std::cout << "Choose GGUF, Ollama, OpenAI, or Anthropic.\n";
+    if (choice == "5" || choice == "custom" ||
+        choice == "openai-compatible") {
+      return ProviderChoice::openai_compatible;
+    }
+    std::cout << "Choose GGUF, Ollama, OpenAI, Anthropic, or Custom.\n";
   }
 }
 
@@ -253,6 +260,14 @@ ModelSlot configure_role(const std::string& name, const std::string& title,
           prompt_url("Anthropic API base URL", "https://api.anthropic.com");
       slot.api_key = prompt_secret("Anthropic API key (input is hidden)");
       slot.model = prompt_api_model(slot.provider, slot.base_url, slot.api_key);
+      break;
+    case ProviderChoice::openai_compatible:
+      slot.provider = "openai";
+      slot.base_url = prompt_url("Custom OpenAI-compatible API base URL",
+                                 "https://api.openai.com/v1");
+      slot.api_key = prompt_secret("Custom API key (input is hidden)");
+      slot.model = prompt_api_model(slot.provider, slot.base_url, slot.api_key,
+                                    false);
       break;
   }
   return slot;

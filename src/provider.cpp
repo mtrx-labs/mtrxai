@@ -700,7 +700,7 @@ std::string environment_key(const std::string& name) {
 
 std::vector<std::string> fetch_available_models(
     const std::string& provider, const std::string& base_url,
-    const std::string& api_key) {
+    const std::string& api_key, bool verify_openai_model_access) {
   if (provider != "openai" && provider != "anthropic") {
     throw std::runtime_error("Model listing is supported for OpenAI-compatible and Anthropic providers");
   }
@@ -774,7 +774,7 @@ std::vector<std::string> fetch_available_models(
       throw std::runtime_error("Model list pagination did not advance");
   }
 
-  if (!anthropic) {
+  if (!anthropic && verify_openai_model_access) {
     // The list can include model IDs that this key cannot retrieve. Confirm
     // each ID against the authenticated model-detail endpoint before showing it.
     std::vector<std::string> accessible;

@@ -67,10 +67,11 @@ host with `ASAN_OPTIONS=detect_leaks=1`.
 Run `mtrxai --init` in an interactive terminal to open the setup wizard. It can
 be run again to replace the saved configuration and credentials. If model
 listing fails, the wizard lets you retry with a corrected API key or enter a
-model ID manually. For each role it offers GGUF, Ollama, OpenAI, and Anthropic.
-OpenAI uses `https://api.openai.com/v1` directly and checks listed model IDs
-against the authenticated model-detail endpoint, including sampling
-permissions when returned, before presenting choices.
+model ID manually. For each role it offers GGUF, Ollama, OpenAI, Anthropic, and
+Custom. OpenAI uses `https://api.openai.com/v1` directly and checks listed
+model IDs against the authenticated model-detail endpoint, including sampling
+permissions when returned, before presenting choices. Custom accepts an
+OpenAI-compatible API base URL and API key.
 Anthropic uses its API key to fetch model IDs for numbered selection; if model
 listing is unavailable, a model ID can be entered manually. GGUF paths support
 `~` expansion and must point to a readable file. API-key entry is hidden.
