@@ -158,10 +158,10 @@ def check_setup_wizard(binary, root):
         output.clear()
 
     try:
-        answer("Choose a provider (1-4 or name)", b"1\n")
+        answer("Choose a provider (1-5 or name)", b"1\n")
         answer("Path to GGUF model", b"~/models/chief.gguf\n")
         wait_for("2 / 3")
-        answer("Choose a provider (1-4 or name)", b"3\n")
+        answer("Choose a provider (1-5 or name)", b"3\n")
         wait_for("OpenAI API key (input is hidden)")
         assert b"OpenAI-compatible API base URL" not in transcript
         os.write(master, b"wizard-openai-secret\n")
@@ -171,7 +171,7 @@ def check_setup_wizard(binary, root):
         assert b"blocked-openai-model" not in transcript
         answer("Select a model number", b"2\n")
         wait_for("3 / 3")
-        answer("Choose a provider (1-4 or name)", b"4\n")
+        answer("Choose a provider (1-5 or name)", b"4\n")
         answer("Anthropic API base URL",
                f"http://127.0.0.1:{server.server_port}\n".encode())
         answer("Anthropic API key (input is hidden)", b"wizard-anthropic-secret\n")
@@ -281,20 +281,22 @@ def check_setup_wizard(binary, root):
             rewrite_output.clear()
 
         try:
-            answer_rewrite("Choose a provider (1-4 or name)", b"2\n")
+            answer_rewrite("Choose a provider (1-5 or name)", b"2\n")
             assert b"will be replaced" in rewrite_transcript
             answer_rewrite("Ollama server URL", b"\n")
             answer_rewrite("Ollama model name", b"replacement-ollama\n")
             wait_rewrite("2 / 3")
-            answer_rewrite("Choose a provider (1-4 or name)", b"3\n")
-            answer_rewrite("OpenAI API key (input is hidden)", b"wrong-key\n")
+            answer_rewrite("Choose a provider (1-5 or name)", b"5\n")
+            answer_rewrite("Custom OpenAI-compatible API base URL",
+                           f"http://127.0.0.1:{server.server_port}/v1\n".encode())
+            answer_rewrite("Custom API key (input is hidden)", b"wrong-key\n")
             answer_rewrite("Try again with a different API key", b"1\n")
             answer_rewrite("API key (input is hidden)",
                            b"wizard-openai-corrected\n")
             wait_rewrite("replacement-openai-model")
             answer_rewrite("Select a model number", b"1\n")
             wait_rewrite("3 / 3")
-            answer_rewrite("Choose a provider (1-4 or name)", b"1\n")
+            answer_rewrite("Choose a provider (1-5 or name)", b"1\n")
             answer_rewrite("Path to GGUF model", b"~/models/chief.gguf\n")
             wait_rewrite("Setup complete.")
             assert drain_exit(rewrite, rewrite_master, 5) == 0
@@ -304,7 +306,10 @@ def check_setup_wizard(binary, root):
             rewritten = json.loads(config_path.read_text())
             assert rewritten["chief"]["provider"] == "ollama"
             assert rewritten["chief"]["model"] == "replacement-ollama"
+            assert rewritten["prompter"]["provider"] == "openai"
             assert rewritten["prompter"]["model"] == "replacement-openai-model"
+            assert rewritten["prompter"]["base_url"] == (
+                f"http://127.0.0.1:{server.server_port}/v1")
             assert rewritten["coder"]["provider"] == "gguf"
             assert json.loads(credentials_path.read_text()) == {
                 "prompter": "wizard-openai-corrected"
