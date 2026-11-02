@@ -1,0 +1,10 @@
+{
+  "name": "@mtrxai/tui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "typecheck": "bun check --no-script" },
+  "exports": { ".": "./src/index.tsx" },
+  "dependencies": { "@mtrxai/core": "workspace:*", "@opentui/core": "0.7.0", "@opentui/solid": "0.7.0", "solid-js": "1.9.17" },
+  "devDependencies": { "@types/bun": "1.4.3", "@tsconfig/bun": "1.0.9", "typescript": "6.0.2" }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "@mtrxai/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": { "mtrxai": "./bin/mtrxai.cjs" },
+  "scripts": { "dev": "bun src/index.ts", "build": "bun build src/index.ts --compile --outfile dist/mtrxai", "typecheck": "bun check --no-script" },
+  "dependencies": { "@mtrxai/core": "workspace:*", "@mtrxai/tui": "workspace:*" },
+  "devDependencies": { "@types/bun": "1.4.3", "@tsconfig/bun": "1.0.9", "typescript": "6.0.2" }
+}
